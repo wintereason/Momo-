@@ -1,0 +1,33 @@
+{
+  "version": 1,
+  "note": "Names are display labels only. Logic must use ids. Expressions listed are what the reference sheet shows.",
+  "characters": [
+    { "id": "gojo",   "label": "Gojo",   "tagline": "Cool & Chill",
+      "sheetExpressions": ["happy","excited","thinking","sorry","sleepy","angry"],
+      "extraDemoViews": ["listening","thinking","task_completed","task_failed","sleeping"] },
+    { "id": "nezuko", "label": "Nezuko", "tagline": "Kind & Caring",
+      "sheetExpressions": ["happy","excited","thinking","sorry","sleepy","sad"] },
+    { "id": "megumi", "label": "Megumi", "tagline": "Calm & Smart",
+      "sheetExpressions": ["happy","focused","thinking","sorry","sleepy","annoyed"] },
+    { "id": "klee",   "label": "Klee",   "tagline": "Cheerful & Energetic",
+      "sheetExpressions": ["happy","excited","thinking","sorry","sleepy","surprised"] },
+    { "id": "mochi",  "label": "Mochi",  "tagline": "Cute & Friendly",
+      "sheetExpressions": ["happy","excited","thinking","sorry","sleepy","confused"] }
+  ],
+  "stateToExpression": {
+    "idle":            ["happy"],
+    "listening":       ["listening","excited","happy"],
+    "transcribing":    ["focused","thinking"],
+    "thinking":        ["thinking"],
+    "asking":          ["confused","surprised","thinking"],
+    "working":         ["focused","thinking"],
+    "success":         ["excited","happy"],
+    "partial_success": ["happy"],
+    "sorry":           ["sorry"],
+    "blocked":         ["focused","annoyed","thinking"],
+    "error":           ["sad","angry","annoyed","sorry"],
+    "sleeping":        ["sleepy"],
+    "disabled":        ["happy"]
+  },
+  "fallbackRule": "For a state, use the first expression in its list that exists for the character; if none exist, use 'happy'; if no sprite exists, show the placeholder."
+}

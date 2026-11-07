@@ -1,0 +1,11 @@
+node_modules/
+target/
+dist/
+.env
+*.key
+*.pem
+secrets/
+public/ort/
+electron/runtime.cjs
+.env.*
+!.env.example

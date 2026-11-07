@@ -1,0 +1,318 @@
+import { execFile } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
+import type { FsPort, OcrResult, RawWindow, ScreenPort, UiNode, UiReadResult, WindowsPort, WindowsSnapshot } from "./ports";
+
+const withTimeout = <T>(p: Promise<T>, ms: number, fallback: T): Promise<T> =>
+  Promise.race([p, new Promise<T>((r) => setTimeout(() => r(fallback), ms))]);
+
+/** Real filesystem access through Node APIs. Never opens File Explorer. */
+export const nodeFs: FsPort = {
+  async listDriveRoots() {
+    const letters = Array.from({ length: 26 }, (_, i) => String.fromCharCode(65 + i));
+    // an unavailable network drive must not stall the whole answer
+    const checks = await Promise.all(letters.map((L) =>
+      withTimeout(fs.promises.access(`${L}:\\`).then(() => true, () => false), 1500, false)));
+    return letters.filter((_, i) => checks[i]).map((L) => `${L}:\\`);
+  },
+  async statfs(root) {
+    const s = await fs.promises.statfs(root);
+    return { total: s.blocks * s.bsize, free: s.bavail * s.bsize };
+  },
+  async readDirs(p) {
+    try {
+      const entries = await fs.promises.readdir(p, { withFileTypes: true });
+      return entries.filter((e) => e.isDirectory()).map((e) => e.name); // symlinks/junctions are not followed
+    } catch {
+      return null;
+    }
+  },
+  async readEntries(p) {
+    try {
+      const entries = await fs.promises.readdir(p, { withFileTypes: true });
+      return entries.filter((e) => e.isDirectory() || e.isFile()).map((e) => ({ name: e.name, isDir: e.isDirectory() }));
+    } catch {
+      return null;
+    }
+  },
+  async stat(p) {
+    try {
+      return { isDir: (await fs.promises.stat(p)).isDirectory() };
+    } catch {
+      return null;
+    }
+  },
+  homeDir: () => os.homedir(),
+};
+
+/**
+ * Runs a FIXED PowerShell script and returns the last JSON object it printed.
+ * Nothing from the user, from window titles or from screen text is ever interpolated into a script;
+ * the only substituted value is an integer window handle validated by the caller.
+ */
+export function runPowerShell<T>(script: string, timeoutMs: number, stdin?: string): Promise<T> {
+  const encoded = Buffer.from(script, "utf16le").toString("base64");
+  return new Promise<T>((resolve, reject) => {
+    const child = execFile(
+      "powershell.exe",
+      ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
+      { timeout: timeoutMs, windowsHide: true, maxBuffer: 16 * 1024 * 1024 },
+      (err, stdout) => {
+        if (err) return reject(err);
+        const line = stdout.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.startsWith("{")).pop();
+        if (!line) return reject(new Error("no output"));
+        try { resolve(JSON.parse(line) as T); } catch (e) { reject(e); }
+      },
+    );
+    // Data (like text to type) travels as JSON on stdin, never inside the script text.
+    child.stdin?.end(stdin ?? "", "utf8");
+  });
+}
+
+// ------------------------------------------------------------------ windows
+
+const WINDOWS_SCRIPT = String.raw`
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class MomoWin {
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+}
+"@
+$fg = [MomoWin]::GetForegroundWindow()
+$fgPid = [uint32]0
+[void][MomoWin]::GetWindowThreadProcessId($fg, [ref]$fgPid)
+$wins = @(Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle } | ForEach-Object {
+  [pscustomobject]@{ hwnd = [int64]$_.MainWindowHandle; pid = [int]$_.Id; process = [string]$_.ProcessName; title = [string]$_.MainWindowTitle }
+})
+[pscustomobject]@{ activePid = [int]$fgPid; activeHwnd = [int64]$fg; windows = $wins } | ConvertTo-Json -Compress -Depth 4
+`;
+
+/** Real window listing through the Win32 API (via a short-lived PowerShell process). */
+export const nodeWindows: WindowsPort = {
+  async query(): Promise<WindowsSnapshot> {
+    const raw = await runPowerShell<{ activePid?: number; activeHwnd?: number; windows?: RawWindow | RawWindow[] }>(WINDOWS_SCRIPT, 10_000);
+    const list = Array.isArray(raw.windows) ? raw.windows : raw.windows ? [raw.windows] : [];
+    return {
+      activePid: raw.activePid && raw.activePid > 0 ? raw.activePid : null,
+      activeHwnd: raw.activeHwnd && raw.activeHwnd > 0 ? raw.activeHwnd : null,
+      windows: list,
+    };
+  },
+};
+
+// ------------------------------------------------------------------ looking at a window
+
+const UIA_SCRIPT = String.raw`
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+try {
+  Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
+  # Older toolkits (WinForms, classic Win32) don't mark password boxes for accessibility and even report the
+  # secret text as the control's name. Windows itself still knows: the ES_PASSWORD style or a password character.
+  # The helper is compiled lazily, only if such a control is actually met (most apps never need it).
+  $script:pwdReady = $false
+  function Test-LegacyPassword([int]$nh) {
+    if (-not $script:pwdReady) {
+      Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class MomoPwd {
+  [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] public static extern int GetWindowLong(IntPtr h, int index);
+  [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW")] public static extern IntPtr SendMessageTimeout(IntPtr h, int msg, IntPtr w, IntPtr l, int flags, int timeout, out IntPtr result);
+}
+"@
+      $script:pwdReady = $true
+    }
+    $hh = [IntPtr]$nh
+    if (([MomoPwd]::GetWindowLong($hh, -16) -band 0x20) -ne 0) { return $true }
+    $res = [IntPtr]::Zero
+    [void][MomoPwd]::SendMessageTimeout($hh, 0x00D2, [IntPtr]::Zero, [IntPtr]::Zero, 2, 100, [ref]$res)
+    return ($res -ne [IntPtr]::Zero)
+  }
+  $hwnd = __HWND__
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  $actionable = @('Button', 'CheckBox', 'RadioButton', 'MenuItem', 'TabItem', 'Hyperlink', 'ListItem', 'Edit', 'ComboBox', 'SplitButton')
+  function Read-Tree {
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$hwnd)
+    $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+    $items = New-Object System.Collections.Generic.List[object]
+    $stack = New-Object System.Collections.Stack
+    $stack.Push(@($root, 0))
+    $visited = 0; $edits = 0
+    while ($stack.Count -gt 0 -and $visited -lt 700 -and $sw.ElapsedMilliseconds -lt 8000) {
+      $pair = $stack.Pop(); $el = $pair[0]; $depth = $pair[1]; $visited++
+      try { $c = $el.Current } catch { continue }
+      $type = $c.ControlType.ProgrammaticName -replace '^ControlType\.', ''
+      $name = [string]$c.Name
+      $isPwd = $false
+      try { $isPwd = [bool]$c.IsPassword } catch {}
+      if (-not $isPwd) {
+        try {
+          $nh = [int]$c.NativeWindowHandle
+          if ($nh -ne 0 -and ([string]$c.ClassName) -match 'EDIT|TextBox') {
+            if (Test-LegacyPassword $nh) { $isPwd = $true }
+          }
+        } catch {}
+      }
+      $value = $null
+      $readOnly = $false
+      if ($type -eq 'Edit' -and -not $isPwd -and $edits -lt 15) {
+        $edits++
+        try { $pat = $null; if ($el.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pat)) { $value = [string]$pat.Current.Value; $readOnly = [bool]$pat.Current.IsReadOnly } } catch {}
+      }
+      # actionable controls carry their runtime id (to find exactly this control again) and their on/off state
+      $rid = ''
+      $state = ''
+      if ($actionable -contains $type) {
+        try { $rid = ($el.GetRuntimeId() -join '.') } catch {}
+        try {
+          $pat = $null
+          if (($type -eq 'CheckBox' -or $type -eq 'RadioButton') -and $el.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pat)) {
+            $state = $(if ([string]$pat.Current.ToggleState -eq 'On') { 'on' } else { 'off' })
+          } elseif (($type -eq 'TabItem' -or $type -eq 'RadioButton') -and $el.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$pat)) {
+            $state = $(if ($pat.Current.IsSelected) { 'selected' } else { 'unselected' })
+          }
+        } catch {}
+      }
+      if ($name -or $value -or $isPwd) {
+        $items.Add(@{ t = "$type"; n = "$name"; e = [bool]$c.IsEnabled; o = [bool]$c.IsOffscreen; v = $(if ($value) { "$value" } else { '' }); p = [bool]$isPwd; r = "$rid"; s = "$state"; ro = [bool]$readOnly })
+      }
+      if ($depth -lt 14) {
+        $kids = New-Object System.Collections.Generic.List[object]
+        try { $ch = $walker.GetFirstChild($el); while ($ch -ne $null -and $kids.Count -lt 60) { $kids.Add($ch); $ch = $walker.GetNextSibling($ch) } } catch {}
+        for ($i = $kids.Count - 1; $i -ge 0; $i--) { $stack.Push(@($kids[$i], ($depth + 1))) }
+      }
+    }
+    @{ items = $items; truncated = ($stack.Count -gt 0) }
+  }
+  $r = Read-Tree
+  # Chromium-based apps build their accessibility tree only after a client asks: look again once
+  if ($r.items.Count -lt 15) { Start-Sleep -Milliseconds 600; $r2 = Read-Tree; if ($r2.items.Count -gt $r.items.Count) { $r = $r2 } }
+  # The built-in JSON serializers choke on these COM-derived values in Windows PowerShell 5.1: write the JSON by hand
+  function J($s) { ([string]$s) -replace '[\x00-\x1f]', ' ' -replace '\\', '\\' -replace '"', '\"' }
+  function B($b) { if ($b) { 'true' } else { 'false' } }
+  $parts = New-Object System.Collections.Generic.List[string]
+  foreach ($it in $r.items) {
+    $parts.Add('{"t":"' + (J $it.t) + '","n":"' + (J $it.n) + '","e":' + (B $it.e) + ',"o":' + (B $it.o) + ',"v":"' + (J $it.v) + '","p":' + (B $it.p) + ',"r":"' + (J $it.r) + '","s":"' + (J $it.s) + '","ro":' + (B $it.ro) + '}')
+  }
+  '{"ok":true,"truncated":' + (B $r.truncated) + ',"items":[' + ($parts -join ',') + ']}'
+} catch {
+  [pscustomobject]@{ ok = $false; error = 'uia_failed' } | ConvertTo-Json -Compress
+}
+`;
+
+const OCR_SCRIPT = String.raw`
+$ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+function Fail($code) { [pscustomobject]@{ ok = $false; error = $code } | ConvertTo-Json -Compress; exit 0 }
+try {
+  Add-Type -AssemblyName System.Drawing
+  Add-Type -AssemblyName System.Runtime.WindowsRuntime
+  Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class MomoCap {
+  [StructLayout(LayoutKind.Sequential)] public struct RECT { public int Left, Top, Right, Bottom; }
+  [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr hdc, uint flags);
+}
+"@
+  [void][MomoCap]::SetProcessDPIAware()
+  $h = [IntPtr]__HWND__
+  if (-not [MomoCap]::IsWindow($h)) { Fail 'gone' }
+  if ([MomoCap]::IsIconic($h)) { Fail 'minimized' }
+  $r = New-Object MomoCap+RECT
+  [void][MomoCap]::GetWindowRect($h, [ref]$r)
+  $w = $r.Right - $r.Left; $ht = $r.Bottom - $r.Top
+  if ($w -lt 20 -or $ht -lt 20) { Fail 'empty' }
+
+  # the pixels exist only in this process's memory: they are never written to disk or sent anywhere
+  $bmp = New-Object System.Drawing.Bitmap $w, $ht
+  $g = [System.Drawing.Graphics]::FromImage($bmp)
+  $hdc = $g.GetHdc()
+  $ok = [MomoCap]::PrintWindow($h, $hdc, 2)
+  $g.ReleaseHdc($hdc); $g.Dispose()
+  if (-not $ok) { Fail 'capture_failed' }
+
+  [void][Windows.Storage.Streams.RandomAccessStream, Windows.Storage.Streams, ContentType = WindowsRuntime]
+  [void][Windows.Graphics.Imaging.BitmapDecoder, Windows.Graphics.Imaging, ContentType = WindowsRuntime]
+  [void][Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
+  $max = [Windows.Media.Ocr.OcrEngine]::MaxImageDimension
+  if ($w -gt $max -or $ht -gt $max) {
+    $s = [Math]::Min($max / $w, $max / $ht)
+    $small = New-Object System.Drawing.Bitmap ([int]($w * $s)), ([int]($ht * $s))
+    $g2 = [System.Drawing.Graphics]::FromImage($small)
+    $g2.DrawImage($bmp, 0, 0, $small.Width, $small.Height); $g2.Dispose()
+    $bmp.Dispose(); $bmp = $small
+  }
+  $ms = New-Object System.IO.MemoryStream
+  $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+  $png = $ms.ToArray()
+
+  $asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -like 'IAsyncOperation*' })[0]
+  function Await($op, $type) { $t = $asTask.MakeGenericMethod($type).Invoke($null, @($op)); $t.Wait(-1) | Out-Null; $t.Result }
+  $stream = New-Object Windows.Storage.Streams.InMemoryRandomAccessStream
+  $out = [System.IO.WindowsRuntimeStreamExtensions]::AsStreamForWrite($stream)
+  $out.Write($png, 0, $png.Length); $out.Flush(); $stream.Seek(0) | Out-Null
+  $decoder = Await ([Windows.Graphics.Imaging.BitmapDecoder]::CreateAsync($stream)) ([Windows.Graphics.Imaging.BitmapDecoder])
+  $bitmap = Await ($decoder.GetSoftwareBitmapAsync()) ([Windows.Graphics.Imaging.SoftwareBitmap])
+  $engine = [Windows.Media.Ocr.OcrEngine]::TryCreateFromUserProfileLanguages()
+  if (-not $engine) { Fail 'no_ocr' }
+  $res = Await ($engine.RecognizeAsync($bitmap)) ([Windows.Media.Ocr.OcrResult])
+  $lines = @($res.Lines | ForEach-Object { [string]$_.Text })
+  [pscustomobject]@{ ok = $true; lines = $lines } | ConvertTo-Json -Compress -Depth 3
+} catch {
+  [pscustomobject]@{ ok = $false; error = 'ocr_failed' } | ConvertTo-Json -Compress
+}
+`;
+
+const validHwnd = (h: number) => Number.isSafeInteger(h) && h > 0;
+
+interface RawUi { ok: boolean; error?: string; truncated?: boolean; items?: { t: string; n: string; e: boolean; o: boolean; v?: string | null; p?: boolean; r?: string; s?: string; ro?: boolean }[] }
+interface RawOcr { ok: boolean; error?: string; lines?: string[] | string }
+
+const OCR_REASONS: Record<string, string> = {
+  gone: "the window has closed",
+  minimized: "the window is minimized",
+  empty: "the window has no visible area",
+  capture_failed: "Windows wouldn't let me capture that window",
+  no_ocr: "this PC has no text-recognition language installed",
+  ocr_failed: "the screenshot couldn't be read",
+};
+
+/** Real window inspection: UI Automation for structure and text, capture + Windows OCR as the fallback. */
+export const nodeScreen: ScreenPort = {
+  async readUi(hwnd: number): Promise<UiReadResult> {
+    if (!validHwnd(hwnd)) return { ok: false, reason: "invalid window" };
+    try {
+      const raw = await runPowerShell<RawUi>(UIA_SCRIPT.replace("__HWND__", String(hwnd)), 20_000);
+      if (!raw.ok) return { ok: false, reason: "Windows UI Automation couldn't read that window" };
+      const items: UiNode[] = (Array.isArray(raw.items) ? raw.items : raw.items ? [raw.items] : []).map((i) => ({
+        type: String(i.t), name: String(i.n ?? ""), enabled: !!i.e, offscreen: !!i.o,
+        value: i.v ? String(i.v) : undefined, password: !!i.p,
+        rid: i.r ? String(i.r) : undefined, state: i.s ? String(i.s) : undefined, readOnly: !!i.ro,
+      }));
+      return { ok: true, items, truncated: !!raw.truncated };
+    } catch {
+      return { ok: false, reason: "Windows UI Automation didn't answer in time" };
+    }
+  },
+
+  async ocr(hwnd: number): Promise<OcrResult> {
+    if (!validHwnd(hwnd)) return { ok: false, reason: "invalid window" };
+    try {
+      const raw = await runPowerShell<RawOcr>(OCR_SCRIPT.replace("__HWND__", String(hwnd)), 30_000);
+      if (!raw.ok) return { ok: false, reason: OCR_REASONS[raw.error ?? ""] ?? "the screenshot couldn't be read" };
+      const lines = Array.isArray(raw.lines) ? raw.lines : raw.lines ? [raw.lines] : [];
+      return { ok: true, lines: lines.map(String) };
+    } catch {
+      return { ok: false, reason: "reading the screenshot took too long" };
+    }
+  },
+};
