@@ -11,9 +11,13 @@ export const HOSTS = {
 } as const;
 
 export interface ChatMessage { role: "user" | "assistant"; text: string }
+/** one small picture (PNG, base64) for a model that can look at it */
+export interface ImageInput { mime: "image/png"; base64: string }
 export interface LlmRequest {
   system: string;
   messages: ChatMessage[];
+  /** attached to the LAST user message */
+  image?: ImageInput;
   /** ask the model for a JSON object */
   json: boolean;
   maxTokens: number;
@@ -40,7 +44,10 @@ export function buildRequest(p: ProviderEntry, model: string, req: LlmRequest): 
         headers: { "content-type": "application/json", "x-goog-api-key": p.key ?? "" },
         body: json({
           systemInstruction: { parts: [{ text: req.system }] },
-          contents: req.messages.map((m) => ({ role: m.role === "assistant" ? "model" : "user", parts: [{ text: m.text }] })),
+          contents: req.messages.map((m, i) => ({
+            role: m.role === "assistant" ? "model" : "user",
+            parts: [{ text: m.text }, ...(req.image && i === req.messages.length - 1 ? [{ inlineData: { mimeType: req.image.mime, data: req.image.base64 } }] : [])],
+          })),
           generationConfig: gen,
         }),
       };
@@ -50,7 +57,12 @@ export function buildRequest(p: ProviderEntry, model: string, req: LlmRequest): 
       const groq = p.provider === "groq";
       const body: Record<string, unknown> = {
         model,
-        messages: [{ role: "system", content: req.system }, ...req.messages.map((m) => ({ role: m.role, content: m.text }))],
+        messages: [{ role: "system", content: req.system }, ...req.messages.map((m, i) => ({
+          role: m.role,
+          content: req.image && i === req.messages.length - 1
+            ? [{ type: "text", text: m.text }, { type: "image_url", image_url: { url: `data:${req.image.mime};base64,${req.image.base64}` } }]
+            : m.text,
+        }))],
         temperature: 0.2,
       };
       body[groq ? "max_completion_tokens" : "max_tokens"] = req.maxTokens;
@@ -68,7 +80,7 @@ export function buildRequest(p: ProviderEntry, model: string, req: LlmRequest): 
         headers: { "content-type": "application/json" },
         body: json({
           model, stream: false, ...(req.json ? { format: "json" } : {}),
-          messages: [{ role: "system", content: req.system }, ...req.messages.map((m) => ({ role: m.role, content: m.text }))],
+          messages: [{ role: "system", content: req.system }, ...req.messages.map((m, i) => ({ role: m.role, content: m.text, ...(req.image && i === req.messages.length - 1 ? { images: [req.image.base64] } : {}) }))],
           options: { num_predict: req.maxTokens, temperature: 0.2 },
         }),
       };

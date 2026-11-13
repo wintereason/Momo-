@@ -3,14 +3,12 @@ import type { PageProps } from "../SettingsApp";
 import { MIC_MESSAGES, listMicrophones, testMicrophone } from "../../voice/micSession";
 import { createWhisperAdapter, whisper, type ModelState } from "../../voice/whisperClient";
 import type { DownloadProgress } from "../../voice/progress";
+import { LANGUAGES, languageLabel } from "../../state/languages";
+import { desktop } from "../../desktop";
 import { Speaker, type VoiceLike } from "../../voice/tts";
 
 const localAdapter = createWhisperAdapter();
 
-const LANGUAGES: [string, string][] = [
-  ["en", "English"], ["hi", "Hindi"], ["mr", "Marathi"], ["gu", "Gujarati"], ["bn", "Bengali"],
-  ["ta", "Tamil"], ["te", "Telugu"], ["es", "Spanish"], ["fr", "French"], ["de", "German"],
-];
 
 export function VoicePage({ prefs, set }: PageProps) {
   const [speaker] = useState(() => new Speaker());
@@ -22,6 +20,7 @@ export function VoicePage({ prefs, set }: PageProps) {
     return () => { clearInterval(t); clearTimeout(stop); };
   }, [speaker]);
   const vo = prefs.voiceOutput;
+  const cloud = prefs.speechEngine === "cloud";
   const setVo = (patch: Partial<typeof vo>) => set({ voiceOutput: { ...vo, ...patch } });
   const [model, setModel] = useState<ModelState>(whisper.state);
   const [cached, setCached] = useState<boolean | null>(null);
@@ -38,9 +37,11 @@ export function VoicePage({ prefs, set }: PageProps) {
   }, []);
   useEffect(() => whisper.subscribe(() => setModel(whisper.state)), []);
   useEffect(() => { void whisper.isCached().then(setCached); }, [model]);
-  useEffect(() => { if (prefs.localModelConsent || cached) void listMicrophones().then(setMics).catch(() => setMics([])); }, [prefs.localModelConsent, cached]);
+  useEffect(() => { if (prefs.localModelConsent || cached || cloud) void listMicrophones().then(setMics).catch(() => setMics([])); }, [prefs.localModelConsent, cached, cloud]);
 
   const ready = model === "ready" || cached === true;
+  const [groqKey, setGroqKey] = useState(false);
+  useEffect(() => { void desktop?.envStatus().then((e) => setGroqKey(!!e?.ai.keys.groq)).catch(() => {}); }, []);
 
   const download = async () => {
     set({ localModelConsent: true });
@@ -59,18 +60,45 @@ export function VoicePage({ prefs, set }: PageProps) {
 
   return (
     <>
-      <h1>Voice &amp; microphone</h1>
-      <p className="lead">Your voice is turned into text by Whisper, which runs on this PC. Audio is never saved and never sent anywhere.</p>
+      <header className="page-head"><h1>Language &amp; voice</h1><p className="lead">Choose what you speak and how accurately Momo should listen.</p></header>
 
-      <fieldset>
-        <legend>Speech model</legend>
-        <p className="notice" role="note"><strong>How it works:</strong> {localAdapter.disclosure} The model uses some memory while loaded and is released after 5 idle minutes.</p>
+      <section className="panel">
+        <h2>Language you speak</h2>
+        <label className="field">Spoken language
+          <select value={prefs.speechLanguage} onChange={(e) => set({ speechLanguage: e.target.value })}>
+            <option value="auto">Detect automatically</option>
+            <optgroup label="Indian languages">{LANGUAGES.filter((l) => l.group === "India").map((l) => <option key={l.code} value={l.code}>{languageLabel(l)}</option>)}</optgroup>
+            <optgroup label="Other languages">{LANGUAGES.filter((l) => l.group === "World").map((l) => <option key={l.code} value={l.code}>{languageLabel(l)}</option>)}</optgroup>
+          </select>
+        </label>
+        <p className="hint">Your words are written in the language's own script (Hindi in देवनागरी, Tamil in தமிழ், and so on). Picking the language is more accurate than automatic detection.</p>
+      </section>
+
+      <section className="panel">
+        <h2>How should Momo listen?</h2>
+        <label className={cloud ? "choice on" : "choice"}>
+          <input type="radio" name="engine" checked={cloud} onChange={() => set({ speechEngine: "cloud" })} />
+          <span><strong>Cloud speech <span className="badge ok">Most accurate</span></strong>
+            <em>Whisper large-v3 on Groq's servers. Best for Hindi and every other language; needs internet and a free Groq key. Your audio is sent to Groq for each sentence and is not stored by Momo.</em></span>
+        </label>
+        <label className={!cloud ? "choice on" : "choice"}>
+          <input type="radio" name="engine" checked={!cloud} onChange={() => set({ speechEngine: "local" })} />
+          <span><strong>On this PC <span className="badge">Private</span></strong>
+            <em>Works offline. Your audio never leaves this PC. Less accurate for non-English languages.</em></span>
+        </label>
+        {cloud && !groqKey && <p className="notice" role="note">Cloud speech needs a free <strong>Groq key</strong> (console.groq.com): add it in <em>AI &amp; keys</em>. Until then Momo uses the speech model on this PC.</p>}
+        {cloud && groqKey && <p className="hint" role="status">✓ Groq key found. If the internet is down, Momo falls back to the model on this PC{ready ? "" : " (download it below)"}.</p>}
+      </section>
+
+      <section className="panel">
+        <h2>Speech model on this PC</h2>
+        <p className="hint">{localAdapter.disclosure} It uses some memory while loaded and is released after 5 idle minutes.</p>
         {ready ? (
-          <p className="hint" role="status">✓ The speech model is on this PC. Momo works without an internet connection for speech.</p>
+          <p className="hint" role="status">✓ The speech model is on this PC.</p>
         ) : (
-          <div className="row"><button className="primary" onClick={download} disabled={model === "loading" || !online}>{model === "loading" ? "Downloading…" : "Download speech model (about 75 MB)"}</button></div>
+          <div className="row"><button className="primary" onClick={download} disabled={model === "loading" || !online}>{model === "loading" ? "Downloading…" : "Download speech model (about 250 MB)"}</button></div>
         )}
-        {!ready && !online && <p className="hint" role="status">You're offline. Connect once to download the model; after that no connection is needed.</p>}
+        {!ready && !online && <p className="hint" role="status">You're offline. Connect once to download the model.</p>}
         {progress && (
           <div role="progressbar" aria-valuenow={progress.percent} aria-valuemin={0} aria-valuemax={100} className="bar">
             <i style={{ width: `${progress.percent}%` }} />
@@ -78,17 +106,7 @@ export function VoicePage({ prefs, set }: PageProps) {
           </div>
         )}
         {model === "error" && <p className="error" role="alert">Couldn't load the speech model: {whisper.lastError || "unknown error"}. Check your connection and try again.</p>}
-      </fieldset>
-
-      <fieldset>
-        <legend>Language you speak</legend>
-        <label className="field">Spoken language
-          <select value={prefs.speechLanguage} onChange={(e) => set({ speechLanguage: e.target.value })}>
-            {LANGUAGES.map(([code, name]) => <option key={code} value={code}>{name}</option>)}
-          </select>
-        </label>
-        <p className="hint">Whisper can't tell the language by itself, so pick the one you speak most. The written result keeps the same language.</p>
-      </fieldset>
+      </section>
 
       <fieldset>
         <legend>Microphone</legend>
@@ -100,8 +118,7 @@ export function VoicePage({ prefs, set }: PageProps) {
             </select>
           </label>
         )}
-        <div className="row"><button onClick={runTest} disabled={testing || !ready}>Test microphone</button></div>
-        {!ready && <p className="hint">Download the speech model first; then you can test the microphone.</p>}
+        <div className="row"><button onClick={runTest} disabled={testing}>Test microphone</button></div>
         {testResult && <p className="hint" role="status">{testResult}</p>}
       </fieldset>
 

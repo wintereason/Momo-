@@ -9,3 +9,5 @@ public/ort/
 electron/runtime.cjs
 .env.*
 !.env.example
+release/
+shots/

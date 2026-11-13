@@ -10,7 +10,7 @@ export type BarMode = "dictate" | "agent";
 
 /** The panel above the pill: a decision to make, a question, or a result to read. */
 export interface BarCard {
-  kind: "confirm" | "ask" | "result" | "answer";
+  kind: "confirm" | "ask" | "result" | "answer" | "field";
   text: string;
   /** the task the card belongs to (Yes/No go back to exactly this one) */
   taskId?: string;
@@ -26,6 +26,8 @@ export interface BarState {
   /** a second, quieter line (e.g. "AI is off, so I only fixed the basics") */
   detail?: string;
   card?: BarCard;
+  /** only for phase "problem": how serious it is. It drives the character's face (sorry / careful / alarmed), nothing else. */
+  tone?: "failed" | "warning" | "error";
 }
 
 export const initialBar: BarState = { phase: "idle", mode: "dictate", message: "" };
@@ -40,7 +42,17 @@ export interface DictateResult {
   note?: string;
   inserted?: boolean;
   copied?: boolean;
-  blocked?: "password" | "keys_held" | "empty";
+  blocked?: "password" | "keys_held" | "empty" | "target_lost" | "not_confirmed" | "no_field" | "expired";
+  /** the text was pasted into a verified field; did we see it arrive? */
+  verified?: "confirmed" | "unconfirmed" | "overwritten" | "unreadable";
+  /** the name of the field it went into */
+  field?: string;
+  /** a selection was in the way: the text was added after it instead of replacing it */
+  collapsedSelection?: boolean;
+  /** Momo needs the user: pick one of the listed fields, or click inside one */
+  needs?: "choose" | "click";
+  options?: { id: number; label: string; detail?: string }[];
+  cancelled?: boolean;
 }
 
 export type BarEvent =
@@ -50,7 +62,8 @@ export type BarEvent =
   | { type: "goal" } //                  the words were handed to the agent as a goal
   | { type: "agent"; event: RuntimeEvent }
   | { type: "result"; result: DictateResult; mode: "type" | "copy" }
-  | { type: "problem"; message: string; detail?: string }
+  | { type: "waiting" } //             waiting for the user to click inside a text box
+  | { type: "problem"; message: string; detail?: string; tone?: "failed" | "warning" | "error" }
   | { type: "reset" };
 
 export function barReducer(s: BarState, e: BarEvent): BarState {
@@ -59,7 +72,8 @@ export function barReducer(s: BarState, e: BarEvent): BarState {
     case "heard": return { ...s, phase: "transcribing", message: "Writing it down…", card: s.card };
     case "recognised": return { phase: "polishing", mode: "dictate", message: e.polishing ? "Polishing…" : "Almost there…" };
     case "goal": return { phase: "thinking", mode: "agent", message: "Working it out…" };
-    case "problem": return { phase: "problem", mode: s.mode, message: e.message, detail: e.detail };
+    case "waiting": return { phase: "asking", mode: "dictate", message: "Click inside a text box…", card: s.card };
+    case "problem": return { phase: "problem", mode: s.mode, message: e.message, detail: e.detail, tone: e.tone ?? "error" };
     case "reset": return initialBar;
     case "result": return fromResult(e.result, e.mode);
     case "agent": return fromAgent(s, e.event);
@@ -68,13 +82,31 @@ export function barReducer(s: BarState, e: BarEvent): BarState {
 
 function fromResult(r: DictateResult, mode: "type" | "copy"): BarState {
   const base = { mode: "dictate" as const };
-  if (!r.ok) return { ...base, phase: "problem", message: r.reason || "Something went wrong." };
+  if (!r.ok) return { ...base, phase: "problem", message: r.reason || "Something went wrong.", tone: "error" };
+  if (r.cancelled) return initialBar;
+  // Momo needs the user before it can write: pick one of several fields, or click into one (never typed into a guess)
+  if (r.needs === "choose" && r.options?.length) {
+    return { ...base, phase: "asking", message: "Which text box?", card: { kind: "field", text: "Which text box should I write in?", options: r.options.map((o) => ({ label: o.label, detail: o.detail })) } };
+  }
+  if (r.needs === "click") {
+    return { ...base, phase: "asking", message: "Click inside a text box…", card: { kind: "field", text: "I can't see a text box to write in. Click inside the one you want and I'll write it there." } };
+  }
   const how = r.polished ? (r.source ? `Polished by ${r.source}` : "Polished") : r.note ? "Basic fixes only" : undefined;
-  if (r.blocked === "password") return { ...base, phase: "problem", message: "Not typed: that looks like a password box.", detail: "Momo skips password boxes it can recognise." };
-  if (r.blocked === "keys_held") return { ...base, phase: "problem", message: "Copied. Press Ctrl+V to paste.", detail: "I couldn't paste for you because a key was still held down." };
-  if (r.blocked) return { ...base, phase: "problem", message: "I couldn't write that." };
+  if (r.blocked === "password") return { ...base, phase: "problem", message: "Not typed: that looks like a password box.", detail: "Momo skips password boxes it can recognise.", tone: "warning" };
+  if (r.blocked === "keys_held") return { ...base, phase: "problem", message: "Copied. Press Ctrl+V to paste.", detail: "I couldn't paste for you because a key was still held down.", tone: "warning" };
+  if (r.blocked === "no_field") return { ...base, phase: "problem", message: "Copied. Press Ctrl+V to paste.", detail: "I didn't find a text box to write in.", tone: "warning" };
+  if (r.blocked === "target_lost") return { ...base, phase: "problem", message: "Copied. Press Ctrl+V to paste.", detail: "I couldn't focus that text box, so I didn't type.", tone: "warning" };
+  if (r.blocked === "not_confirmed") return { ...base, phase: "problem", message: "Copied. Press Ctrl+V to paste.", detail: "I pasted, but couldn't see the text arrive.", tone: "warning" };
+  if (r.blocked === "expired") return { ...base, phase: "problem", message: "That took too long. Please dictate again.", tone: "warning" };
+  if (r.blocked) return { ...base, phase: "problem", message: "I couldn't write that.", tone: "error" };
   if (mode === "copy" || !r.inserted) return { ...base, phase: "done", message: "Copied. Press Ctrl+V to paste.", detail: r.note ?? how };
-  return { ...base, phase: "done", message: "Inserted", detail: r.note ?? how };
+  const where = r.field ? ` into "${r.field.slice(0, 30)}"` : "";
+  const sel = r.collapsedSelection ? "Added after your selection. " : "";
+  if (r.verified === "overwritten") return { ...base, phase: "problem", message: "Written, but it replaced existing text.", detail: "Press Ctrl+Z in that box to undo.", tone: "warning" };
+  if (r.verified === "confirmed") return { ...base, phase: "done", message: `Inserted${where}`, detail: sel + (r.note ?? how ?? "") || undefined };
+  // pasted into the right field, but the text could not be read back: not claimed as success
+  const why = r.verified === "unconfirmed" ? "The field changed other text too: please check it." : "This app doesn't let me read the text back to check.";
+  return { ...base, phase: "done", message: `Pasted${where} (not confirmed)`, detail: sel + why };
 }
 
 /** Show what the agent is doing, and hold every question and decision until the user answers it. */
@@ -83,7 +115,7 @@ function fromAgent(s: BarState, e: RuntimeEvent): BarState {
   switch (e.type) {
     case "task.state":
       if (e.state === "working") return { ...base, phase: "thinking", message: (e.message || "Working…").slice(0, 80) };
-      if (e.state === "partial_success") return { ...base, phase: "problem", message: "Not fully confirmed", detail: e.message, card: e.message ? { kind: "result", text: e.message } : undefined };
+      if (e.state === "partial_success") return { ...base, phase: "problem", tone: "warning", message: "Not fully confirmed", detail: e.message, card: e.message ? { kind: "result", text: e.message } : undefined };
       if (e.state === "idle") return e.message ? { ...base, phase: "done", message: e.message.slice(0, 80) } : initialBar;
       return s;
     case "task.confirmation_required":
@@ -95,9 +127,9 @@ function fromAgent(s: BarState, e: RuntimeEvent): BarState {
     case "task.answer":
       return { ...base, phase: "done", message: e.source ? `Answer · ${e.source}` : "Answer", card: { kind: "answer", text: e.text, taskId: e.taskId } };
     case "task.failed":
-      return { ...base, phase: "problem", message: "I couldn't do that", card: { kind: "result", text: e.summary, taskId: e.taskId } };
+      return { ...base, phase: "problem", tone: e.recoverable ? "failed" : "error", message: "I couldn't do that", card: { kind: "result", text: e.summary, taskId: e.taskId } };
     case "runtime.error":
-      return { ...base, phase: "problem", message: e.message.slice(0, 80) };
+      return { ...base, phase: "problem", tone: "error", message: e.message.slice(0, 80) };
     default:
       return s; // voice.* and transcript events belong to the voice pipeline, not to the agent
   }
@@ -105,9 +137,10 @@ function fromAgent(s: BarState, e: RuntimeEvent): BarState {
 
 /** How long a finished or failed bar stays before it returns to idle. Questions and decisions never time out here. */
 export const holdMs = (s: BarState): number => {
+  if (s.card?.kind === "field") return 60_000;
   if (s.card) return Math.min(15_000, 4_000 + s.card.text.length * 45); // long enough to read what Momo said
   return s.phase === "problem" ? 4500 : s.detail ? 3200 : 1800;
 };
 
 /** Phases in which the bar must accept clicks (a button to press). */
-export const needsClicks = (s: BarState): boolean => !!s.card || s.phase === "thinking";
+export const needsClicks = (s: BarState): boolean => !!s.card || s.phase === "thinking" || s.phase === "asking";

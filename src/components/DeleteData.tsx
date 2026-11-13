@@ -26,7 +26,7 @@ export function DeleteData() {
   if (step === "confirm") {
     return (
       <div className="notice" role="alertdialog" aria-label="Delete everything Momo stored">
-        <p><strong>This removes everything Momo has stored on this PC:</strong> your settings, the AI request counter and the downloaded speech model (about 75 MB; you can download it again).</p>
+        <p><strong>This removes everything Momo has stored on this PC:</strong> your settings, the AI request counter and the downloaded speech model (about 250 MB; you can download it again).</p>
         <p>Momo never saves audio, transcripts or screenshots, so there is nothing else to delete. Anything already sent to a cloud speech service is outside Momo's control.</p>
         <div className="row">
           <button className="primary" onClick={run}>Yes, delete everything</button>

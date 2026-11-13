@@ -56,6 +56,38 @@ export class Verifier {
     return fail("no window for that app appeared");
   }
 
+  /**
+   * Windows that already belong to this app (the app is RUNNING), front-most first. Matching is by the app's name in the window title or
+   * process name, like appWindow(); an app whose windows use a different name is simply not recognised as running (so it gets launched).
+   */
+  runningWindows<T extends { title: string; process: string; isMomo: boolean; z?: number }>(snap: { windows: T[] }, appName: string): T[] {
+    const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+    const generic = new Set(["google", "microsoft", "windows", "app", "the", "inc", "corporation"]);
+    const all = norm(appName).split(" ").filter((t) => t.length > 1);
+    const specific = all.filter((t) => !generic.has(t));
+    const tokens = specific.length > 0 ? specific : all;
+    if (tokens.length === 0) return [];
+    // File Explorer windows are titled after the folder ("Downloads"), so for it the program itself is what counts
+    const byProgram = norm(appName) === "file explorer" ? "explorer" : null;
+    return snap.windows
+      .filter((w) => !w.isMomo && (byProgram ? norm(w.process) === byProgram : tokens.every((t) => norm(`${w.title} ${w.process}`).includes(t))))
+      .sort((a, b) => (a.z ?? 999) - (b.z ?? 999));
+  }
+
+  /**
+   * The app has no window but IS running (an app that lives in the tray, or one whose windows are all closed): the matching program, or null.
+   * Matched on the app's own name against program names, so a program that is merely similar is not claimed.
+   */
+  backgroundProcess(processes: readonly string[] | undefined, appName: string): string | null {
+    if (!processes || processes.length === 0) return null;
+    const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, "");
+    const generic = new Set(["google", "microsoft", "windows", "app", "the", "inc", "corporation"]);
+    const words = appName.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter((t) => t.length >= 3 && !generic.has(t));
+    if (words.length === 0) return null;
+    const joined = norm(appName);
+    return processes.find((p) => { const n = norm(p); return n.length >= 3 && (n === joined || words.every((w) => n.includes(w)) || (words.length === 1 && n === words[0])); }) ?? null;
+  }
+
   /** After opening a folder in VS Code: a Code window showing that folder. */
   vscodeFolder(snap: DesktopSnapshot, folderPath: string): Verdict {
     const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
@@ -114,6 +146,26 @@ export class Verifier {
     return after !== before
       ? { verified: true, evidence: ["the window's controls or state changed after the click"], confidence: 0.8 }
       : fail("nothing visibly changed after the click");
+  }
+
+  /**
+   * After using a control whose purpose was understood: did the SPECIFIC thing it should do happen? (A toggle must have flipped, a menu
+   * button must have opened something.) null = there is no specific check for this kind of effect: the general "something changed" applies.
+   */
+  componentEffect(effect: string, before: { state?: string; expanded?: string } | undefined, after: { state?: string; expanded?: string } | undefined, listSizeBefore: number, listSizeAfter: number): Verdict | null {
+    switch (effect) {
+      case "toggles":
+        if (!before || !after) return fail("the switch could not be found again afterwards");
+        return before.state !== after.state
+          ? { verified: true, evidence: [`it was ${before.state ?? "?"} and is now ${after.state ?? "?"}`], confidence: 0.95 }
+          : fail("the switch did not change");
+      case "opens_menu":
+        if (after?.expanded === "expanded" && before?.expanded !== "expanded") return { verified: true, evidence: ["it reports being expanded now"], confidence: 0.95 };
+        if (listSizeAfter > listSizeBefore + 1) return { verified: true, evidence: [`${listSizeAfter - listSizeBefore} more entries appeared (a menu opened)`], confidence: 0.8 };
+        return fail("no menu or list opened");
+      default:
+        return null;
+    }
   }
 
   /** Sanity-check what was read from a window before it is reported. */

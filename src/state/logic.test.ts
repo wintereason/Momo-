@@ -163,7 +163,7 @@ describe("preferences persistence", () => {
     savePrefs(m, defaultPrefs);
     expect([...m.data.keys()]).toEqual([PREFS_KEY]);
     expect(Object.keys(JSON.parse(m.data.get(PREFS_KEY)!)).sort()).toEqual(
-      ["activationMode", "agentShortcut", "dictation", "localModelConsent", "microphoneId", "permissions", "privacy", "shortcut", "speechLanguage", "version", "voiceOutput"],
+      ["activationMode", "agentShortcut", "character", "dictation", "humanInput", "localModelConsent", "microphoneId", "permissions", "privacy", "shadowCursor", "shortcut", "speechEngine", "speechLanguage", "version", "voiceOutput"],
     );
   });
 });

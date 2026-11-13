@@ -1,5 +1,5 @@
 import { runPowerShell } from "../shared/nodePorts";
-import type { ActResult, InputPort, SetTextResult, WindowState } from "../shared/ports";
+import type { ActResult, InputPort, SetTextResult, SubmitResult, WindowState } from "../shared/ports";
 
 /**
  * Real window and control actions (Windows). Every script is FIXED text; the target and any text to
@@ -64,6 +64,15 @@ $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 function Fail($code) { '{"ok":false,"error":"' + $code + '"}'; exit 0 }
 function J($s) { ([string]$s) -replace '[\x00-\x1f]', ' ' -replace '\\', '\\' -replace '"', '\"' }
+# Is this element the field that was identified? Browsers may renumber an element's runtime id once their accessibility tree
+# is built, so the id alone is not enough: the same type, name and on-screen box also count.
+function Same-Field($fe, [string]$rid, $ct, [string]$nm, [string]$box) {
+  try {
+    if (($fe.GetRuntimeId() -join '.') -eq $rid) { return $true }
+    $f = $fe.Current
+    return ($f.ControlType.Id -eq $ct -and [string]$f.Name -eq $nm -and $f.BoundingRectangle.ToString() -eq $box)
+  } catch { return $false }
+}
 try {
   $req = [Console]::In.ReadToEnd() | ConvertFrom-Json
   Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
@@ -73,6 +82,7 @@ try {
   $el = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
   if (-not $el) { Fail 'not_found' }
   $c = $el.Current
+  $idType = $c.ControlType.Id; $idName = [string]$c.Name; $idBox = $c.BoundingRectangle.ToString()
   # the control must still be exactly what the user was shown and agreed to
   if ([string]$c.Name -ne [string]$req.name) { Fail 'changed' }
   if (-not $c.IsEnabled) { Fail 'disabled' }
@@ -95,6 +105,52 @@ try {
     $pat.SetValue([string]$req.text)
     $back = [string]$pat.Current.Value
     '{"ok":true,"value":"' + (J $back) + '"}'
+  } elseif ($mode -eq 'focus' -or $mode -eq 'submit') {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Runtime.InteropServices;
+public static class MomoKey {
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+  [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
+  [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+  [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+  [DllImport("user32.dll")] public static extern void keybd_event(byte vk, byte scan, uint flags, UIntPtr extra);
+}
+"@
+    $h2 = [IntPtr][long]$req.hwnd
+    $AE = [System.Windows.Automation.AutomationElement]
+    if ($mode -eq 'focus') {
+      if ([MomoKey]::IsIconic($h2)) { [void][MomoKey]::ShowWindow($h2, 9) }
+      if ([MomoKey]::GetForegroundWindow() -ne $h2) {
+        # Windows only lets the foreground process change the foreground: a quick Alt tap makes the request legitimate
+        [MomoKey]::keybd_event(0x12, 0, 0, [UIntPtr]::Zero); [MomoKey]::keybd_event(0x12, 0, 2, [UIntPtr]::Zero)
+        [void][MomoKey]::SetForegroundWindow($h2)
+        Start-Sleep -Milliseconds 150
+      }
+      $el.SetFocus()
+      $okf = $false
+      for ($i = 0; $i -lt 12; $i++) {
+        try { $fe = $AE::FocusedElement; if ($fe -ne $null -and (Same-Field $fe ([string]$req.rid) $idType $idName $idBox)) { $okf = $true; break } } catch {}
+        Start-Sleep -Milliseconds 100
+      }
+      if (-not $okf) { Fail 'focus_failed' }
+      '{"ok":true}'
+    } else {
+      # Enter goes only to the field that was identified AND still has the keyboard focus: never a blind keystroke
+      $fe = $AE::FocusedElement
+      if ($fe -eq $null -or -not (Same-Field $fe ([string]$req.rid) $idType $idName $idBox)) { Fail 'not_focused' }
+      function Read-Val($e) { try { $vp = $null; if ($e.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp)) { return [string]$vp.Current.Value } } catch {}; return '' }
+      $valBefore = Read-Val $el
+      $titleBefore = [string]$root.Current.Name
+      [MomoKey]::keybd_event(0x0D, 0, 0, [UIntPtr]::Zero); [MomoKey]::keybd_event(0x0D, 0, 2, [UIntPtr]::Zero)
+      # the result of Enter: the box was cleared or changed, the page moved on (its title changed), or the box is gone
+      $changed = $false
+      for ($i = 0; $i -lt 16 -and -not $changed; $i++) {
+        Start-Sleep -Milliseconds 125
+        try { if ((Read-Val $el) -ne $valBefore -or [string]$root.Current.Name -ne $titleBefore) { $changed = $true } } catch { $changed = $true }
+      }
+      '{"ok":true,"changed":' + $(if ($changed) { 'true' } else { 'false' }) + '}'
+    }
   } else { Fail 'bad_mode' }
 } catch {
   '{"ok":false,"error":"failed"}'
@@ -112,6 +168,8 @@ const CONTROL_REASONS: Record<string, string> = {
   password: "that is a password field, which I never touch",
   no_pattern: "that control doesn't let other programs use it",
   readonly: "that field is read-only",
+  focus_failed: "I couldn't put the cursor in that field",
+  not_focused: "the cursor isn't in that field any more",
   failed: "Windows wouldn't let me do that",
 };
 const WINDOW_REASONS: Record<string, string> = {
@@ -119,7 +177,7 @@ const WINDOW_REASONS: Record<string, string> = {
   failed: "Windows wouldn't let me do that",
 };
 
-interface RawAct { ok: boolean; error?: string; value?: string; exists?: boolean; minimized?: boolean; pid?: number; fgPid?: number }
+interface RawAct { ok: boolean; error?: string; changed?: boolean; value?: string; exists?: boolean; minimized?: boolean; pid?: number; fgPid?: number }
 
 async function windowCall(mode: string, hwnd: number): Promise<RawAct> {
   return runPowerShell<RawAct>(WINDOW_SCRIPT, 15_000, JSON.stringify({ mode, hwnd }));
@@ -155,6 +213,26 @@ export const nodeInput: InputPort = {
     try {
       const r = await runPowerShell<RawAct>(CONTROL_SCRIPT, 20_000, JSON.stringify({ mode: "invoke", hwnd, rid, name: expectName }));
       return r.ok ? { ok: true } : { ok: false, reason: CONTROL_REASONS[r.error ?? ""] ?? CONTROL_REASONS.failed };
+    } catch {
+      return { ok: false, reason: "Windows didn't answer in time" };
+    }
+  },
+
+  async focusControl(hwnd: number, rid: string, expectName: string): Promise<ActResult> {
+    if (!validHwnd(hwnd) || !validRid(rid)) return { ok: false, reason: "I can't identify that field" };
+    try {
+      const r = await runPowerShell<RawAct>(CONTROL_SCRIPT, 20_000, JSON.stringify({ mode: "focus", hwnd, rid, name: expectName }));
+      return r.ok ? { ok: true } : { ok: false, reason: CONTROL_REASONS[r.error ?? ""] ?? CONTROL_REASONS.failed };
+    } catch {
+      return { ok: false, reason: "Windows didn't answer in time" };
+    }
+  },
+
+  async submitControl(hwnd: number, rid: string, expectName: string): Promise<SubmitResult> {
+    if (!validHwnd(hwnd) || !validRid(rid)) return { ok: false, reason: "I can't identify that field" };
+    try {
+      const r = await runPowerShell<RawAct>(CONTROL_SCRIPT, 20_000, JSON.stringify({ mode: "submit", hwnd, rid, name: expectName }));
+      return r.ok ? { ok: true, changed: !!r.changed } : { ok: false, reason: CONTROL_REASONS[r.error ?? ""] ?? CONTROL_REASONS.failed };
     } catch {
       return { ok: false, reason: "Windows didn't answer in time" };
     }

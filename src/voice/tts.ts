@@ -60,13 +60,24 @@ export interface SpeakOptions {
   lang: string;
 }
 
+/** What the Speaker reports while it talks (used to move the character's mouth in time). `index` is a position in `text`. */
+export type SpeechEvent = { type: "start"; text: string; rate: number } | { type: "boundary"; index: number } | { type: "end" };
+
 export class Speaker {
+  private listener: ((e: SpeechEvent) => void) | null = null;
+  private pending = new Set<object>();
   constructor(
     private synth: SynthLike | null = typeof window !== "undefined" ? (window.speechSynthesis as unknown as SynthLike) ?? null : null,
     private Utterance: UtteranceCtor | null = typeof window !== "undefined"
       ? ((window as unknown as { SpeechSynthesisUtterance?: UtteranceCtor }).SpeechSynthesisUtterance ?? null)
       : null,
   ) {}
+
+  /** Hear when speech starts, passes each word, and ends. One listener; pass null to remove it. */
+  listen(cb: ((e: SpeechEvent) => void) | null): void {
+    this.listener = cb;
+  }
+  private emit(e: SpeechEvent) { try { this.listener?.(e); } catch { /* a listener must never break speech */ } }
 
   get available(): boolean {
     return !!this.synth && !!this.Utterance;
@@ -80,18 +91,28 @@ export class Speaker {
   speak(text: string, o: SpeakOptions, replace = true): boolean {
     const spoken = speechText(text);
     if (!this.synth || !this.Utterance || !spoken) return false;
-    if (replace) this.synth.cancel();
+    if (replace) { this.pending.clear(); this.synth.cancel(); }
     const u = new this.Utterance(spoken);
     u.rate = Math.min(1.6, Math.max(0.6, Number.isFinite(o.rate) ? o.rate : 1));
     u.volume = 1;
     const voice = pickVoice(this.synth.getVoices(), o.voiceURI, o.lang);
     if (voice) { u.voice = voice; u.lang = voice.lang; } else u.lang = o.lang;
+    const token = {};
+    this.pending.add(token);
+    const ev = u as unknown as { onstart: (() => void) | null; onend: (() => void) | null; onerror: (() => void) | null; onboundary: ((e: { charIndex?: number }) => void) | null };
+    ev.onstart = () => { if (this.pending.has(token)) this.emit({ type: "start", text: spoken, rate: u.rate }); };
+    ev.onboundary = (e) => { if (this.pending.has(token) && typeof e.charIndex === "number") this.emit({ type: "boundary", index: e.charIndex }); };
+    const done = () => { if (!this.pending.delete(token)) return; if (this.pending.size === 0) this.emit({ type: "end" }); };
+    ev.onend = done; ev.onerror = done;
     this.synth.speak(u);
     return true;
   }
 
   /** Stop talking (e.g. as soon as the user starts speaking). */
   stop(): void {
+    const wasSpeaking = this.pending.size > 0;
+    this.pending.clear();
     this.synth?.cancel();
+    if (wasSpeaking) this.emit({ type: "end" });
   }
 }

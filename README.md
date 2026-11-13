@@ -22,7 +22,10 @@ momo-project/
 ├── assets/
 │   ├── reference/                 <- original images (visual reference only, NOT 3D models)
 │   │   ├── character_sheet_expressions.png
-│   │   └── group_bench_scene.png
+│   │   ├── group_bench_scene.png
+│   │   ├── avatar_sheet_pink.png  <- supplied 3x2 expression sheet (pink-haired girl)
+│   │   └── avatar_sheet_dark.png  <- supplied 3x2 expression sheet (dark-haired boy)
+│   ├── avatars/<art>/{head,full}/ <- cut-out sprites from those two sheets (checked in, built by a script)
 │   ├── characters/<id>/           <- cut-out expression PNGs go here (see ASSET_GUIDE.md)
 │   ├── scene/                     <- table, blossom backdrop
 │   ├── models/                    <- future .glb files
@@ -59,6 +62,19 @@ cherry petals, and the character with state effects (mic waves, thought dots, st
 - Check it for real: `electron scripts/check-scene-live.cjs <id> <2d|3d> [prod]` (screenshots + frame cost), then
   `node scripts/scene-contact-sheet.cjs <id> <view>`.
 
+### Avatar art
+The character on the bar can be the hand-drawn Momo or one of the two supplied 3D-style avatar sheets (pink-haired
+girl, dark-haired boy). Settings → Character → **Avatar art** switches between `drawn`, `pink` and `dark`; `pink` is
+the default.
+
+- Each sheet is 3 columns × 2 rows = six drawn faces. Momo maps every semantic expression (listening, thinking,
+  happy, sad, …) to the closest drawn face, so it never shows a face the artist did not draw. The compact bar uses a
+  head-and-shoulders crop, the expanded bar and the Settings preview use the whole figure.
+- The sprites are real cut-outs, not re-drawn code: `node scripts/cut-avatar-sheets.mjs` removes the studio set, the
+  display base, its “AVATAR 3D” print and the sparkles, keeps the legs and shoes, and writes transparent PNGs to
+  `assets/avatars/<art>/{head,full}/<cell>.png` plus `_check-<art>.png` contact sheets for a visual check.
+- Choosing `drawn` brings back the original SVG character and its hairstyle/outfit options.
+
 ## Privacy and safety guarantees (each one is enforced by a test)
 - Nothing is saved except settings, the window position, and the downloaded speech model. No audio, transcripts,
   screenshots or task history. (`src/audit/privacy.test.ts`)
@@ -90,3 +106,12 @@ No paid service is supported. By default the AI would only ever see the words yo
 (`MOMO_AI_ALLOW_SCREEN_CONTEXT=false`), because free cloud tiers may log prompts.
 The file is read only by the desktop shell; Settings -> Connections shows a tick or dash per key, never a value.
 The AI keys are detected but **not used yet** (the AI feature isn't built).
+
+## Install and use (Windows)
+Build the installer once with `npm run dist` → `release/Momo Setup 0.1.0.exe`. Run it (no admin needed); Momo appears in the Start menu and on the desktop.
+1. First run: Settings opens. Allow the microphone and accept the one-time speech-model download (~250 MB).
+2. Click into any text box (browser, Notepad, VS Code, chat app), then hold the dictation shortcut (see Settings → Shortcut), speak, release.
+3. Momo finds the text box, writes at your cursor and checks the text arrived. If it can't tell which box, it asks you.
+4. Pick your language (Hindi etc. are written in their own script). For the best accuracy add a free `GROQ_API_KEY` and choose *Cloud speech*. Momo starts with Windows and waits in the tray (turn off in General).
+4. Optional AI polish: put a free key in `%APPDATA%\Momo\.env` (see `.env.example`), then Settings → AI & keys → Re-read .env.
+Not code-signed yet: Windows SmartScreen may show "unknown publisher" (More info → Run anyway).

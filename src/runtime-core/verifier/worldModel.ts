@@ -6,7 +6,7 @@ export type EntityType = "desktop" | "window" | "drive" | "folder" | "control" |
 export type EvidenceSource =
   | "fs.statfs" | "fs.readdir" | "fs.stat"
   | "win32.foreground" | "win32.windows"
-  | "uia" | "ocr"
+  | "uia" | "ocr" | "vision"
   | "user";
 
 export interface Entity {
@@ -80,6 +80,11 @@ export class WorldModel {
       if (!e.stale && match(e)) { e.stale = true; n++; }
     }
     return n;
+  }
+
+  /** Forget entities matching a test (e.g. the understood controls of a window that was just read again). */
+  prune(match: (e: Entity) => boolean): void {
+    for (const [id, e] of this.entities) if (match(e)) this.entities.delete(id);
   }
 
   /** Remove all entities of a type (e.g. windows that no longer exist). */

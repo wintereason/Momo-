@@ -105,6 +105,11 @@ function reduceInner(s: CompanionState, a: CompanionAction): CompanionState {
         message: undefined,
         result: { summary: a.summary, verified: false, kind: "failed" },
       };
+    case "cursor.move":
+    case "cursor.window":
+    case "cursor.aim":
+    case "cursor.result":
+      return s; // only the shadow cursor cares where Momo is acting
     case "runtime.error":
       if (a.code === "mic_denied" || a.code === "mic_unavailable") {
         return { ui: "disabled", message: a.message };

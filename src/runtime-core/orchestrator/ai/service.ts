@@ -1,7 +1,7 @@
 import type { AiConfig, Provider } from "./config";
 import { isCloud } from "./config";
 import type { LlmClient, LlmFailure } from "./llm";
-import { DICTATION_SYSTEM, PLANNER_SYSTEM, buildPlanInput, parsePlan, wrapDictation, type PlanDecision, type PlanStep, type ToolInfo } from "./prompts";
+import { DICTATION_SYSTEM, PLANNER_SYSTEM, VISION_SYSTEM, buildPlanInput, parsePlan, parseVision, wrapDictation, type PlanDecision, type PlanStep, type ToolInfo, type VisionAnswer } from "./prompts";
 import { acceptPolish } from "../dictation";
 
 export type AiOutcome<T> = ({ ok: true } & T) | { ok: false; reason: LlmFailure | "unusable_answer"; message: string };
@@ -23,6 +23,15 @@ export interface AiService {
   /** Fix grammar and wording of dictated text. Uses only the dictated words; no screen content, no history. */
   polish(text: string, style: "light" | "polish"): Promise<AiOutcome<{ text: string; source: string }>>;
   usage(): { count: number; limit: number };
+  /**
+   * Can a PICTURE be looked at? Only if a provider with a vision model is set up, and (for a cloud one) the user switched on screen context.
+   * Even then, every picture is sent only after the user agrees to that one picture. Absent in simple fakes.
+   */
+  canSeeImages?(): boolean;
+  /** Name of who would look at the picture, for the question asked first ("Gemini") */
+  visionLabel?(): string;
+  /** Look at ONE cropped picture of a control (PNG, base64) and say what it is for. Nothing else is sent. */
+  describeImage?(png: string, controlType: string): Promise<AiOutcome<{ answer: VisionAnswer; source: string }>>;
 }
 
 const NAMES: Record<Provider, string> = { gemini: "Gemini", groq: "Groq", openrouter: "OpenRouter", ollama: "Ollama (this PC)" };
@@ -51,6 +60,31 @@ export function createAiService(llm: LlmClient, config: () => AiConfig): AiServi
     isCloud: () => { const p = first(); return p ? isCloud(p) : false; },
     canSeeScreen: () => { const p = first(); return !!p && (!isCloud(p) || config().allowScreenContext); },
     usage: () => llm.usageToday(),
+
+    canSeeImages: () => {
+      const c = config();
+      if (!c.enabled) return false;
+      const p = c.order.find((e) => !!e.modelVision && (!isCloud(e.provider) || c.allowScreenContext));
+      return !!p;
+    },
+    visionLabel: () => { const c = config(); const p = c.order.find((e) => !!e.modelVision && (!isCloud(e.provider) || c.allowScreenContext)); return p ? NAMES[p.provider] : "the AI"; },
+
+    async describeImage(png, controlType) {
+      const c = config();
+      // never to a cloud provider unless screen context is allowed: only providers that qualify are even tried
+      const eligible = { ...c, order: c.order.filter((e) => !!e.modelVision && (!isCloud(e.provider) || c.allowScreenContext)) };
+      if (!c.enabled) return fail("disabled");
+      if (eligible.order.length === 0) return fail("no_provider");
+      const r = await llm.completeWith(eligible, {
+        system: VISION_SYSTEM, tier: "vision", json: true, maxTokens: 300, timeoutMs: 25_000,
+        messages: [{ role: "user", text: `This is a picture of one ${controlType.replace(/[^A-Za-z ]/g, "").slice(0, 20) || "control"}. What is it and what does it do?` }],
+        image: { mime: "image/png", base64: png },
+      });
+      if (!r.ok) return fail(r.reason);
+      const answer = parseVision(r.text);
+      if (!answer) return fail("unusable_answer");
+      return { ok: true, answer, source: NAMES[r.provider] };
+    },
 
     async plan(goal, steps, tools) {
       const system = PLANNER_SYSTEM(tools);

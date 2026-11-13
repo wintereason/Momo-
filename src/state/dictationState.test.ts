@@ -10,12 +10,12 @@ describe("dictation on the bar", () => {
     s = barReducer(s, { type: "listening", mode: "dictate" }); expect(s).toMatchObject({ phase: "listening", message: "Listening…" });
     s = barReducer(s, { type: "heard" }); expect(s.phase).toBe("transcribing");
     s = barReducer(s, { type: "recognised", polishing: true }); expect(s).toMatchObject({ phase: "polishing", message: "Polishing…" });
-    s = barReducer(s, { type: "result", mode: "type", result: { ok: true, inserted: true, polished: true, source: "Gemini" } });
+    s = barReducer(s, { type: "result", mode: "type", result: { ok: true, inserted: true, verified: "confirmed", polished: true, source: "Gemini" } });
     expect(s).toEqual({ phase: "done", mode: "dictate", message: "Inserted", detail: "Polished by Gemini" });
     expect(barReducer(s, { type: "reset" })).toEqual(initialBar);
   });
   it("tells the truth when the AI could not be used", () => {
-    const s = barReducer(initialBar, { type: "result", mode: "type", result: { ok: true, inserted: true, polished: false, note: "AI is off, so I only fixed the basics." } });
+    const s = barReducer(initialBar, { type: "result", mode: "type", result: { ok: true, inserted: true, verified: "confirmed", polished: false, note: "AI is off, so I only fixed the basics." } });
     expect(s).toMatchObject({ phase: "done", message: "Inserted", detail: "AI is off, so I only fixed the basics." });
   });
   it("copy mode, and a paste that could not happen, say 'Copied' and never 'Inserted'", () => {
@@ -26,6 +26,29 @@ describe("dictation on the bar", () => {
   it("a password box is refused and explained, and failures show their reason", () => {
     expect(barReducer(initialBar, { type: "result", mode: "type", result: { ok: true, blocked: "password", inserted: false } })).toMatchObject({ phase: "problem", message: expect.stringMatching(/password/) });
     expect(barReducer(initialBar, { type: "result", mode: "type", result: { ok: false, reason: "I didn't catch any words." } })).toMatchObject({ phase: "problem", message: "I didn't catch any words." });
+  });
+});
+
+describe("dictation asks before it types", () => {
+  it("several text boxes: shows them as a card and waits", () => {
+    const s = barReducer(initialBar, { type: "result", mode: "type", result: { ok: true, needs: "choose", options: [{ id: 0, label: "To" }, { id: 1, label: "Body", detail: "in the middle" }] } });
+    expect(s).toMatchObject({ phase: "asking", card: { kind: "field", options: [{ label: "To" }, { label: "Body", detail: "in the middle" }] } });
+    expect(needsClicks(s)).toBe(true);
+  });
+  it("no text box: asks for a click and keeps the bar clickable", () => {
+    const s = barReducer(initialBar, { type: "result", mode: "type", result: { ok: true, needs: "click" } });
+    expect(s).toMatchObject({ phase: "asking", card: { kind: "field" } });
+    expect(needsClicks(s)).toBe(true);
+  });
+  it("never says 'Inserted' unless the text was seen arriving", () => {
+    const base = { ok: true, inserted: true, copied: true } as const;
+    expect(barReducer(initialBar, { type: "result", mode: "type", result: { ...base, verified: "unreadable" } }).message).toMatch(/not confirmed/);
+    expect(barReducer(initialBar, { type: "result", mode: "type", result: { ...base, verified: "confirmed", field: "Search" } }).message).toBe('Inserted into "Search"');
+    expect(barReducer(initialBar, { type: "result", mode: "type", result: { ...base, verified: "overwritten" } })).toMatchObject({ phase: "problem" });
+    expect(barReducer(initialBar, { type: "result", mode: "type", result: { ok: true, inserted: false, copied: true, blocked: "not_confirmed" } })).toMatchObject({ phase: "problem", message: expect.stringMatching(/^Copied/) });
+  });
+  it("a cancelled question returns to the quiet bar", () => {
+    expect(barReducer(initialBar, { type: "result", mode: "type", result: { ok: true, cancelled: true } })).toEqual(initialBar);
   });
 });
 

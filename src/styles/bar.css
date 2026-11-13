@@ -68,3 +68,23 @@ html.bar-route { font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-s
 .card .options button { all: unset; box-sizing: border-box; width: 100%; cursor: pointer; display: flex; flex-direction: column; gap: 1px; padding: 6px 12px; border-radius: 12px; background: rgba(255, 255, 255, .1); }
 .card .options button:hover, .card .options button:focus-visible { background: rgba(255, 143, 179, .3); outline: none; }
 .card .options small { color: rgba(255, 255, 255, .72); font-size: 12px; word-break: break-all; }
+
+/* Momo, the character: above the pill, never in the way. The whole window stays click-through; only [data-hit] things take the mouse. */
+.dock { position: relative; flex: none; pointer-events: auto; transition: width .25s ease, height .25s ease; filter: drop-shadow(0 6px 14px rgba(0, 0, 0, .35)); }
+.dock.compact { width: 92px; height: 94px; }
+.dock.expanded { width: 270px; height: 296px; }
+.dock-svg { width: 100%; height: 100%; display: block; pointer-events: none; }
+.dock.compact .dock-svg { border-radius: 50%; background: radial-gradient(circle at 50% 38%, rgba(70, 52, 128, .92), rgba(22, 17, 40, .92)); box-shadow: 0 0 0 2px var(--ring, #8b6cff), 0 0 14px var(--ring, #8b6cff); }
+.theme-classic { --ring: #8b6cff; } .theme-cyber { --ring: #19e3ff; } .theme-pastel { --ring: #ff93bd; } .theme-neon { --ring: #ff3df2; }
+.dock-toggle { all: unset; position: absolute; right: 2px; top: 2px; width: 22px; height: 22px; border-radius: 50%; display: grid; place-items: center; font-size: 13px; color: #fff; background: rgba(24, 22, 28, .8); cursor: pointer; opacity: 0; transition: opacity .15s; box-shadow: 0 0 0 1px rgba(255, 255, 255, .2) inset; }
+.dock:hover .dock-toggle, .dock-toggle:focus-visible { opacity: 1; }
+.dock-toggle:focus-visible { outline: 2px solid #ffd1e1; }
+.bar-stage { gap: 0; }
+.bar-stage > .card { margin-bottom: 6px; }
+.bar-stage > .pill { margin-top: 4px; }
+/* Avatar sheets: the cut-out figure stands on nothing, so the pill's edge is its floor. */
+.dock-art { width: 100%; height: 100%; display: block; object-fit: contain; object-position: 50% 100%; pointer-events: none; user-select: none; -webkit-user-drag: none; animation: avatar-in .18s ease-out; }
+.dock.compact .dock-art { filter: drop-shadow(0 2px 3px rgba(0, 0, 0, .35)); }
+.dock.has-art .dock-toggle { background: rgba(24, 22, 28, .92); }
+@keyframes avatar-in { from { opacity: .4; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .dock { transition: none; } .dock-art { animation: none; } }

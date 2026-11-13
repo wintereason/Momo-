@@ -48,8 +48,12 @@ export class LlmClient {
     return { count: u.date === today(this.now()) ? u.count : 0, limit: this.o.config().maxRequestsPerDay };
   }
 
-  async complete(req: Omit<LlmRequest, "maxTokens"> & { tier: "fast" | "smart"; maxTokens?: number; timeoutMs?: number }): Promise<LlmResult> {
-    const cfg = this.o.config();
+  async complete(req: Omit<LlmRequest, "maxTokens"> & { tier: "fast" | "smart" | "vision"; maxTokens?: number; timeoutMs?: number }): Promise<LlmResult> {
+    return this.completeWith(this.o.config(), req);
+  }
+
+  /** Like complete(), but with an explicit (already restricted) provider list. */
+  async completeWith(cfg: AiConfig, req: Omit<LlmRequest, "maxTokens"> & { tier: "fast" | "smart" | "vision"; maxTokens?: number; timeoutMs?: number }): Promise<LlmResult> {
     if (!cfg.enabled) return { ok: false, reason: "disabled" };
     if (cfg.order.length === 0) return { ok: false, reason: "no_provider" };
 
@@ -57,7 +61,8 @@ export class LlmClient {
     for (const entry of cfg.order) {
       if ((this.cooling.get(entry.provider) ?? 0) > this.now()) { failures.push("rate_limited"); continue; }
 
-      const model = req.tier === "fast" ? entry.modelFast : entry.modelSmart;
+      const model = req.tier === "vision" ? entry.modelVision : req.tier === "fast" ? entry.modelFast : entry.modelSmart;
+      if (!model) continue; // this provider has no model that can look at a picture
       const built = buildRequest(entry, model, { ...req, maxTokens: req.maxTokens ?? cfg.maxOutputTokens });
 
       for (let attempt = 0; attempt < 2; attempt++) { // a dropped connection is retried once on the same provider

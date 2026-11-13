@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { CharacterPrefsSchema, defaultCharacter } from "../character/config";
 
 export const PrefsSchema = z.object({
   version: z.literal(1),
@@ -9,10 +10,16 @@ export const PrefsSchema = z.object({
   /** the shortcut to give Momo a GOAL (speak, and Momo plans, acts and checks it) */
   agentShortcut: z.string().max(64).default("Ctrl+Shift+Space"),
   /** spoken language for local Whisper (it cannot auto-detect) */
-  speechLanguage: z.string().regex(/^[a-z]{2,3}$/).default("en"),
+  speechLanguage: z.string().regex(/^([a-z]{2,3}|auto)$/).default("en"),
+  /** where speech is turned into text: on this PC (private), or in the cloud (Groq, more accurate; needs internet and a free key) */
+  speechEngine: z.enum(["local", "cloud"]).default("local"),
   /** the user agreed to download the local speech model */
   localModelConsent: z.boolean().default(false),
   microphoneId: z.string().nullable().default(null),
+  /** show a ghost cursor that glides to where Momo is acting while it works on a task */
+  shadowCursor: z.boolean().default(true),
+  /** act with the real mouse and keyboard, like a person (watched by the shadow cursor; the user can take over any time) */
+  humanInput: z.boolean().default(true),
   /** Momo speaks what it is doing, what it verified and what failed (with the voices already on this PC) */
   voiceOutput: z.object({
     enabled: z.boolean().default(true),
@@ -37,6 +44,8 @@ export const PrefsSchema = z.object({
     /** 2 = "ask only for real decisions" (delete, send, sign in/out, pay...). Older saved settings are reset once. */
     rev: z.literal(2).default(2),
   }).default({ confirmReversible: false, confirmScreenRead: false, rev: 2 }),
+  /** how Momo looks and sounds (appearance, personality, theme, animation). UI only: never reaches the agent. */
+  character: CharacterPrefsSchema.default(defaultCharacter),
   privacy: z.object({
     saveTranscriptHistory: z.boolean(),
     saveRawAudio: z.boolean(),
@@ -50,11 +59,15 @@ export const defaultPrefs: Prefs = {
   shortcut: "Ctrl+Alt+Space",
   agentShortcut: "Ctrl+Shift+Space",
   speechLanguage: "en",
+  speechEngine: "local",
   localModelConsent: false,
   microphoneId: null,
+  shadowCursor: true,
+  humanInput: true,
   voiceOutput: { enabled: true, voiceURI: null, rate: 1 },
   dictation: { style: "polish", mode: "type", restoreClipboard: false },
   permissions: { confirmReversible: false, confirmScreenRead: false, rev: 2 },
+  character: defaultCharacter,
   privacy: { saveTranscriptHistory: false, saveRawAudio: false },
 };
 

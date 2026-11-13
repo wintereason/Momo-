@@ -69,7 +69,7 @@ export function collectControls(items: UiNode[], max = 20): ControlInfo[] {
 
 // ---------------------------------------------------------------- finding a control the user named
 
-const CLICKABLE = new Set(["Button", "MenuItem", "TabItem", "CheckBox", "RadioButton", "Hyperlink", "ListItem", "SplitButton"]);
+const CLICKABLE = new Set(["Button", "MenuItem", "TabItem", "CheckBox", "RadioButton", "Hyperlink", "ListItem", "TreeItem", "DataItem", "SplitButton"]);
 const TYPEABLE = new Set(["Edit", "ComboBox"]);
 const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
 
@@ -119,3 +119,55 @@ export function errorLines(lines: string[]): string[] {
 export function totalChars(lines: string[]): number {
   return lines.reduce((n, l) => n + l.length, 0);
 }
+
+// ---------------------------------------------------------------- which one is on screen, and where
+
+/** The on-screen box of the window these controls belong to (the biggest box among them). */
+function windowBox(items: UiNode[]): { l: number; t: number; w: number; h: number } | null {
+  let best: { l: number; t: number; w: number; h: number } | null = null;
+  for (const n of items) if (n.rect && (!best || n.rect.w * n.rect.h > best.w * best.h)) best = n.rect;
+  return best;
+}
+
+/**
+ * Only the controls that are really SHOWN: not hidden, not scrolled out of the window, and not a sliver. A control with no known
+ * box is kept (some apps do not report one). Two entries for the very same box and name count once.
+ */
+export function onScreen(items: UiNode[], nodes: UiNode[]): UiNode[] {
+  const win = windowBox(items);
+  const seen = new Set<string>();
+  return nodes.filter((n) => {
+    if (n.offscreen) return false;
+    const r = n.rect;
+    if (r) {
+      if (r.w < 6 || r.h < 6) return false;
+      const cx = r.l + r.w / 2, cy = r.t + r.h / 2;
+      if (win && (cx < win.l || cx > win.l + win.w || cy < win.t || cy > win.t + win.h)) return false;
+      const key = `${norm(n.name)}|${r.l},${r.t},${r.w},${r.h}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+    }
+    return true;
+  });
+}
+
+/** "top left", "middle", "bottom right"... where a control is inside its window, in words. */
+export function placeOf(node: UiNode, items: UiNode[]): string {
+  const win = windowBox(items);
+  const r = node.rect;
+  if (!win || !r || win.w <= 0 || win.h <= 0) return "";
+  const fx = (r.l + r.w / 2 - win.l) / win.w, fy = (r.t + r.h / 2 - win.t) / win.h;
+  const v = fy < 0.28 ? "top" : fy > 0.72 ? "bottom" : "middle";
+  const h = fx < 0.33 ? "left" : fx > 0.67 ? "right" : "centre";
+  return v === "middle" && h === "centre" ? "middle of the window" : v === "middle" ? `${h} side` : `${v} ${h}`;
+}
+
+/** The text that tells look-alike controls apart: where it is, and which panel it sits in. */
+export function describePlace(node: UiNode, items: UiNode[]): string {
+  const place = placeOf(node, items);
+  const panel = node.panel && norm(node.panel) !== norm(node.name) ? `in “${cleanScreenText(node.panel).slice(0, 40)}”` : "";
+  return [place, panel].filter(Boolean).join(" · ");
+}
+
+/** The exact box of a control as a key, so a choice made by the user can be found again. */
+export const boxKey = (n: UiNode): string => (n.rect ? `${n.rect.l},${n.rect.t},${n.rect.w},${n.rect.h}` : "");

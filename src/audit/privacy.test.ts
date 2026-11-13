@@ -41,12 +41,19 @@ const files = (h: { file: string }[]) => [...new Set(h.map((x) => x.file))].sort
 describe("what Momo writes to disk", () => {
   it("writes only preferences, the AI request counter, and the speech-model cache", () => {
     const writes = hits(/\b(writeFile|writeFileSync|appendFile|appendFileSync|createWriteStream|localStorage\.setItem|\.setItem\(|sessionStorage|indexedDB|document\.cookie|openDatabase)\b/);
-    expect(files(writes)).toEqual(["electron/main.cjs", "src/state/settings.ts"]);
-    // electron/main.cjs: exactly one write: the AI's daily request counter (a date and a number)
+    expect(files(writes)).toEqual(["electron/env.cjs", "electron/main.cjs", "src/state/settings.ts"]);
+    // electron/env.cjs: exactly one write, inside save(): the keys the user typed into Settings, into Momo's own .env
+    const envWrites = writes.filter((w) => w.file === "electron/env.cjs");
+    expect(envWrites).toHaveLength(1);
+    expect(envWrites[0].line).toContain("fs.writeFileSync(file, out.join(");
+    // electron/main.cjs: exactly two writes: the AI's daily request counter (a date and a number), and the one-byte marker
+    // that says "start-with-Windows was already offered" (so it is only switched on once, on first run)
     const mainWrites = writes.filter((w) => w.file === "electron/main.cjs");
-    expect(mainWrites).toHaveLength(1);
+    expect(mainWrites).toHaveLength(2);
     const usage = mainWrites.find((w) => w.line.includes("usageFile()"))!;
     expect(usage.line).toContain("JSON.stringify({ date: String(u.date), count: Number(u.count) })");
+    const marker = mainWrites.find((w) => w.line.includes("mark"))!;
+    expect(marker.line).toContain('fs.writeFileSync(mark, "1")');
     // settings.ts: preferences only
     expect(writes.filter((w) => w.file === "src/state/settings.ts").every((w) => /PREFS_KEY/.test(w.line))).toBe(true);
   });
@@ -54,10 +61,13 @@ describe("what Momo writes to disk", () => {
   it("the clipboard is written only with text the user dictated (never read from the screen)", () => {
     const hitsClip = hits(/clipboard\.writeText/);
     expect(files(hitsClip)).toEqual(["electron/insert.cjs", "electron/main.cjs"]);
-    // main.cjs: only the dictation "copy" mode, whose text comes from runtime.dictate()
+    // main.cjs: one helper, copyDictated(), only ever called with dictated text (runtime.dictate() output or a held dictation)
     const mainClip = hitsClip.filter((h) => h.file === "electron/main.cjs");
     expect(mainClip).toHaveLength(1);
-    expect(mainClip[0].line).toContain("clipboard.writeText(out.text)");
+    expect(mainClip[0].line).toContain("function copyDictated(dictatedText) { clipboard.writeText(dictatedText); }");
+    const calls = (read("electron/main.cjs").match(/copyDictated\([^)]*\)/g) ?? []).filter((c) => !c.includes("dictatedText"));
+    expect(calls.length).toBeGreaterThan(0);
+    expect(calls.every((c) => /^copyDictated\((out|t)\.text\)$/.test(c))).toBe(true);
   });
 
   it("the only use of the Cache API is the speech model (never user content)", () => {
@@ -66,7 +76,9 @@ describe("what Momo writes to disk", () => {
   });
 
   it("no code reads or stores raw audio, screenshots or transcripts on disk", () => {
-    expect(hits(/\.(wav|mp3|webm|ogg|flac)['"`]/i)).toEqual([]);
+    // (the cloud speech client names its in-memory upload "speech.wav": a multipart label, never a file on disk)
+    expect(hits(/\.(wav|mp3|webm|ogg|flac)['"`]/i).map((h) => h.file)).toEqual(["electron/cloudStt.cjs"]);
+    expect(read("electron/cloudStt.cjs")).not.toMatch(/node:fs|require\("fs"\)|writeFile|createWriteStream/);
     expect(hits(/\b(MediaRecorder|toDataURL|canvas\.toBlob|URL\.createObjectURL)\b/)).toEqual([]);
     // screenshots exist only inside the PowerShell process that OCRs them, in a MemoryStream
     const script = read("src/runtime-core/shared/nodePorts.ts");
@@ -95,7 +107,14 @@ describe("what touches the network", () => {
     const net = hits(/(^|[^\w"'])fetch\b(?!Fn)|\b(XMLHttpRequest|WebSocket\(|EventSource\(|sendBeacon|https?\.request|https?\.get\(|net\.connect|dgram|axios)\b/).filter((n) => !/typeof fetch/.test(n.line));
     // The only other network client is the speech-model loader inside @huggingface/transformers (a dependency).
     // Exactly two places use fetch: one reads the app's OWN bundled files, and the AI client talks to pinned hosts only.
-    expect([...new Set(net.map((n) => n.file))].sort()).toEqual(["electron/appProtocol.cjs", "electron/stt.worker.cjs", "src/runtime-core/orchestrator/ai/llm.ts"]);
+    expect([...new Set(net.map((n) => n.file))].sort()).toEqual(["electron/appProtocol.cjs", "electron/cloudStt.cjs", "electron/stt.worker.cjs", "src/runtime-core/orchestrator/ai/llm.ts"]);
+    // Cloud speech (optional, off unless the user picks it): ONE pinned HTTPS destination, the key only in the header,
+    // and the shell calls it only when the page asked for the cloud engine
+    const cloud = read("electron/cloudStt.cjs");
+    expect(cloud).toMatch(/const URL_GROQ = "https:\/\/api\.groq\.com\/openai\/v1\/audio\/transcriptions";/);
+    expect(cloud.match(/fetchFn\(/g)).toHaveLength(1);
+    expect(cloud).toMatch(/fetchFn\(URL_GROQ,/);
+    expect(strip(read("electron/main.cjs"))).toMatch(/if \(p\.engine === "cloud"\) \{\s*try \{\s*const text = await transcribeCloud\(/);
     // the speech worker never sends anything itself: it only puts the model hub allowlist in front of the library's own download
     const sttWorker = read("electron/stt.worker.cjs");
     expect(sttWorker).toMatch(/makeAllowedRequest\(null\)/);
@@ -201,6 +220,10 @@ describe("the UI may only ask the shell for a fixed set of things", () => {
     // events from the shell to the page are an explicit, short list
     const toPage = new Set([...main.matchAll(/(?:webContents\.send|sendToSettings|sender\.send)\("(momo:[\w-]+)"/g)].map((m) => m[1]));
     expect([...toPage].sort()).toEqual(["momo:runtime-event", "momo:shortcut", "momo:stt-progress"]);
+    // the one more channel, momo:cursor (where the shadow cursor draws), is sent from its own small window file only; the
+    // preload re-checks its fixed shapes and it carries only a control's or window's name
+    const cursorSends = [...read("electron/cursorWindow.cjs").matchAll(/webContents\.send\("(momo:[\w-]+)"/g)].map((m) => m[1]);
+    expect(cursorSends).toEqual(["momo:cursor"]);
   });
 
   it("only the microphone permission is ever granted", () => {
@@ -238,17 +261,21 @@ describe("API keys from .env stay inside the desktop shell", () => {
     const sends = [...main.matchAll(/webContents\.send\([^)]*\)/g)].map((m) => m[0]).join("\n");
     expect(sends).not.toMatch(/envValues|process\.env/);
     // every mention of the raw values is one of these uses: nothing else touches them
-    const allowed = [/^let envValues = \{\};$/, /^envValues = r\.values;$/, /envConfig\.status\(envValues, envFiles\)/, /buildAiConfig\(envValues\)/];
+    const allowed = [/^let envValues = \{\};$/, /^const text = await transcribeCloud\(\{ key: envValues\.GROQ_API_KEY, audio: p\.audio\.slice\(\), language: p\.language \}\);$/, /^envValues = r\.values;$/, /envConfig\.status\(envValues, envFiles\)/, /buildAiConfig\(envValues\)/];
     for (const line of main.split("\n").map((l) => l.trim()).filter((l) => l.includes("envValues"))) {
       expect(allowed.some((a) => a.test(line)), "unexpected use of envValues: " + line).toBe(true);
     }
     expect(strip(read("electron/preload.cjs"))).not.toMatch(/process\.env|envValues/);
   });
 
-  it("the env loader neither logs nor writes anything", () => {
+  it("the env loader neither logs nor writes anything (only save() writes, and only the keys the user typed)", () => {
     const env = strip(read("electron/env.cjs"));
     expect(env).not.toMatch(/console\./);
-    expect(env).not.toMatch(/writeFile|appendFile|createWriteStream|unlink/);
+    expect(env).not.toMatch(/appendFile|createWriteStream|unlink/);
+    // the only write is inside save(); load/parse/status are read-only
+    expect(env.slice(0, env.indexOf("function save("))).not.toMatch(/writeFile/);
+    // save() writes only whitelisted keys, validated first
+    expect(env).toMatch(/if \(!EDITABLE\.includes\(k\)\)/);
     expect(env).not.toMatch(/fetch\(|require\(['"](node:)?(https?|net|dgram|tls)['"]\)|XMLHttpRequest|WebSocket/); // it never contacts anything
   });
 

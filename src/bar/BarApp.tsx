@@ -1,19 +1,29 @@
-import { useCallback, useEffect, useReducer, useRef, useState } from "react";
+import { useCallback, useEffect, useReducer, useRef, useState, useSyncExternalStore } from "react";
 import { desktop, type ShortcutRole } from "../desktop";
-import { loadPrefs, PREFS_KEY, type Prefs } from "../state/settings";
+import { loadPrefs, savePrefs, PREFS_KEY, type Prefs } from "../state/settings";
+import { Momo } from "../character/Momo";
+import { AvatarView } from "../character/AvatarView";
+import { isSpriteArt } from "../character/avatars";
+import { MouthSync } from "../character/speechMouth";
+import { expressionFor } from "../character/expression";
+import { leadIn, styleMessage } from "../character/personality";
 import { barReducer, holdMs, initialBar, needsClicks, type BarEvent, type BarMode, type DictateResult } from "../state/dictationState";
 import { activationStep, type ActivationInput } from "../state/activation";
 import { parseRuntimeEvent } from "../types/runtime-events";
 import { LiveVoice } from "../voice/liveVoice";
 import { MicSession, browserMicDeps } from "../voice/micSession";
 import { createWhisperAdapter, whisper } from "../voice/whisperClient";
+import { wrongScript, languageName } from "../state/languages";
 import { Speaker } from "../voice/tts";
 import { forSpeech, speechFor } from "../state/speech";
 import { Waveform } from "./Waveform";
 import "../styles/bar.css";
 
+// Momo's mouth follows whatever the Speaker is really saying (character code only draws; it never sees the task)
+const mouth = new MouthSync();
 let spokenLanguage = "en";
-const whisperAdapter = createWhisperAdapter(undefined, () => spokenLanguage);
+let speechEngine: "local" | "cloud" = "local";
+const whisperAdapter = createWhisperAdapter(undefined, () => spokenLanguage, () => speechEngine);
 const LEVELS_KEPT = 40;
 
 /**
@@ -31,9 +41,11 @@ export default function BarApp() {
   barRef.current = bar;
   const modeRef = useRef<BarMode>("dictate");
   const speakerRef = useRef<Speaker | null>(null);
-  if (!speakerRef.current) speakerRef.current = new Speaker();
+  if (!speakerRef.current) { speakerRef.current = new Speaker(); speakerRef.current.listen(mouth.handle); }
+  const speaking = useSyncExternalStore(mouth.subscribe.bind(mouth), () => mouth.speaking);
   const goalSeq = useRef(0);
   spokenLanguage = prefs.speechLanguage;
+  speechEngine = prefs.speechEngine;
 
   // Settings is another window of the same app: it saves into the same storage, and we hear about it here.
   useEffect(() => {
@@ -65,24 +77,50 @@ export default function BarApp() {
       const p = prefsRef.current.voiceOutput;
       const say = p.enabled ? speechFor(e) : null;
       if (say) {
+        // the personality adds a short lead-in to results; it never changes what an answer says
+        const pers = prefsRef.current.character.personality;
+        if (e.type === "task.completed") say.text = leadIn("completed", pers) + say.text;
+        else if (e.type === "task.failed") say.text = leadIn("failed", pers) + say.text;
         const s = forSpeech(say);
         speakerRef.current?.speak(s.text, { voiceURI: p.voiceURI, rate: p.rate, lang: prefsRef.current.speechLanguage }, !s.queue);
       }
     });
   }, []);
 
+  // the shadow cursor (shown only while a task runs) can be switched off in Settings
+  useEffect(() => { desktop?.setShadowCursor(prefs.shadowCursor); }, [prefs.shadowCursor]);
+  useEffect(() => { desktop?.setHumanInput(prefs.humanInput); }, [prefs.humanInput]);
+
   // routine things (opening, switching, reading a window on this PC) never ask: only decisions do, and those are not a setting
   useEffect(() => { desktop?.setPolicy({ confirmReversible: false, confirmScreenRead: false }); }, []);
 
   async function finishDictation(text: string) {
     const p = prefsRef.current;
+    // The classic local-model slip: Hindi heard in Urdu letters. With the AI on, the polish step rewrites it in the right
+    // script; without it, typing the wrong script would be useless, so say how to fix it.
+    if (wrongScript(p.speechLanguage, text)) {
+      const env = await desktop?.envStatus().catch(() => null);
+      if (!env?.ai.ready || p.dictation.style === "off") {
+        send({ type: "problem", message: `That came out in the wrong script for ${languageName(p.speechLanguage)}.`, detail: "Turn on Cloud speech in Voice settings for exact results." });
+        return;
+      }
+    }
     send({ type: "recognised", polishing: p.dictation.style !== "off" });
     try {
       const result = (await desktop!.dictate(text, p.dictation.style, p.dictation.mode, p.dictation.restoreClipboard)) as DictateResult;
       send({ type: "result", result, mode: p.dictation.mode });
+      if (result.needs === "click") await waitForClick();
     } catch {
       send({ type: "problem", message: "I couldn't write that. Please try again." });
     }
+  }
+
+  /** No text box was found: Momo waits until the user clicks into one, then writes there. */
+  async function waitForClick() {
+    const result = (await desktop!.dictationWaitClick()) as DictateResult;
+    // answered or cancelled meanwhile? then there is nothing to show
+    if (barRef.current.card?.kind !== "field") return;
+    send({ type: "result", result, mode: "type" });
   }
 
   /** What was said is a goal (or the answer to Momo's question): hand it to the agent. Its events drive the bar from here. */
@@ -126,8 +164,8 @@ export default function BarApp() {
     const live = liveRef.current;
     const phase = barRef.current.phase;
     if (!live) { if (input.kind === "press" && !input.repeat) send({ type: "problem", message: "No microphone is available." }); return; }
-    if (input.kind === "press" && !input.repeat && !p.localModelConsent && !cachedRef.current) {
-      send({ type: "problem", message: "Set up speech first.", detail: "Opening Momo settings…" });
+    if (input.kind === "press" && !input.repeat && p.speechEngine !== "cloud" && !p.localModelConsent && !cachedRef.current) {
+      send({ type: "problem", message: "Set up speech first.", detail: "Opening Momo settings…", tone: "warning" });
       desktop?.openSettings();
       return;
     }
@@ -150,7 +188,7 @@ export default function BarApp() {
     for (const role of ["dictate", "agent"] as const) {
       const chord = role === "dictate" ? prefs.shortcut : prefs.agentShortcut;
       void desktop.setShortcut(role, chord, prefs.activationMode).then((r) => {
-        if (!cancelled && !r.ok) send({ type: "problem", message: r.reason ?? "A shortcut isn't available.", detail: "Pick another in Momo settings." });
+        if (!cancelled && !r.ok) send({ type: "problem", message: r.reason ?? "A shortcut isn't available.", detail: "Pick another in Momo settings.", tone: "warning" });
       });
     }
     const off = desktop.onShortcut((m) => activate(m.role, { kind: m.kind }));
@@ -164,24 +202,75 @@ export default function BarApp() {
     return () => clearTimeout(h);
   }, [bar]);
 
-  // The bar ignores the mouse, except while it has a button to press.
-  const clicks = needsClicks(bar);
-  useEffect(() => { desktop?.barInteractive(clicks); }, [clicks]);
+  // The bar is click-through. Only while the pointer is over a button or card (marked data-hit) does it take the mouse, so the
+  // character and the empty space around it never get in the way of the windows underneath.
+  const overRef = useRef(false);
+  useEffect(() => {
+    const move = (e: MouseEvent) => {
+      const over = !!(e.target as Element | null)?.closest?.("[data-hit]");
+      if (over !== overRef.current) { overRef.current = over; desktop?.barInteractive(over); }
+    };
+    const leave = () => { if (overRef.current) { overRef.current = false; desktop?.barInteractive(false); } };
+    window.addEventListener("mousemove", move);
+    document.addEventListener("mouseleave", leave);
+    return () => { window.removeEventListener("mousemove", move); document.removeEventListener("mouseleave", leave); desktop?.barInteractive(false); };
+  }, []);
+  // a card that disappears under the pointer must not leave the bar catching clicks
+  useEffect(() => { if (!needsClicks(bar) && overRef.current && !document.querySelector("[data-hit]:hover")) { overRef.current = false; desktop?.barInteractive(false); } }, [bar]);
+
+  // the window follows the character's size
+  const ch = prefs.character;
+  useEffect(() => { desktop?.setBarLayout(ch.enabled ? ch.view : "compact"); }, [ch.enabled, ch.view]);
+  const toggleView = () => {
+    const cur = prefsRef.current;
+    const next = { ...cur, character: { ...cur.character, view: cur.character.view === "compact" ? ("expanded" as const) : ("compact" as const) } };
+    savePrefs(window.localStorage, next);
+    setPrefs(next);
+  };
+  const shown = { ...bar, message: styleMessage(bar.message, ch.personality) };
+  const expression = expressionFor(bar, speaking, ch.personality);
 
   useEffect(() => () => liveRef.current?.cancel(), []);
 
   const cancelTask = () => { desktop?.cancelTask(); liveRef.current?.cancel(); dispatch({ type: "reset" }); };
   const answer = (taskId: string, yes: boolean) => { desktop?.respondConfirmation(taskId, yes); if (!yes) dispatch({ type: "reset" }); };
   // clicking an option is the same as saying its number: Momo opens it at once
+  // choosing a text box to write in (the text is held by the desktop shell, in memory, until you choose or cancel)
+  const pickField = async (index: number) => {
+    send({ type: "recognised", polishing: false });
+    try { send({ type: "result", result: (await desktop!.dictationPick(index)) as DictateResult, mode: "type" }); }
+    catch { send({ type: "problem", message: "I couldn't write that. Please try again." }); }
+  };
+  const cancelField = () => { desktop?.dictationCancel(); dispatch({ type: "reset" }); };
   const pick = (index: number) => { speakerRef.current?.stop(); giveGoal(String(index + 1)); };
 
   if (!desktop) return null;
   const card = bar.card;
   return (
-    <div className="bar-stage">
+    <div className={`bar-stage view-${ch.enabled ? ch.view : "none"} theme-${ch.theme}`}>
       {card && (
-        <div className={`card ${card.kind}`} role={card.kind === "confirm" || card.kind === "ask" ? "alertdialog" : "status"} aria-live="polite">
-          {card.kind === "ask" && card.options && card.options.length > 0 ? (
+        <div data-hit className={`card ${card.kind}`} role={card.kind === "confirm" || card.kind === "ask" ? "alertdialog" : "status"} aria-live="polite">
+          {card.kind === "field" && card.options && card.options.length > 0 ? (
+            <>
+              <p>{card.text}</p>
+              <ol className="options">
+                {card.options.map((o, i) => (
+                  <li key={i}>
+                    <button onClick={() => void pickField(i)}>
+                      <strong>{i + 1}. {o.label}</strong>
+                      {o.detail && <small>{o.detail}</small>}
+                    </button>
+                  </li>
+                ))}
+              </ol>
+              <div className="buttons"><button onClick={cancelField}>Cancel</button></div>
+            </>
+          ) : card.kind === "field" ? (
+            <>
+              <p>{card.text}</p>
+              <div className="buttons"><button onClick={cancelField}>Cancel</button></div>
+            </>
+          ) : card.kind === "ask" && card.options && card.options.length > 0 ? (
             <>
               <p>Which one should I use?</p>
               <ol className="options">
@@ -213,19 +302,27 @@ export default function BarApp() {
           {(card.kind === "result" || card.kind === "answer") && <div className="buttons"><button onClick={() => dispatch({ type: "reset" })}>Close</button></div>}
         </div>
       )}
-      <div className={`pill ${bar.phase} ${bar.mode}`} role="status" aria-live="polite">
+      {ch.enabled && (
+        <div className={`dock ${ch.view}${isSpriteArt(ch.art) ? " has-art" : ""}`}>
+          {isSpriteArt(ch.art)
+            ? <AvatarView character={ch} expression={expression} view={ch.view} className="dock-art" />
+            : <Momo appearance={ch} expression={expression} mouth={mouth} view={ch.view} className="dock-svg" />}
+          <button data-hit className="dock-toggle" onClick={toggleView} aria-label={ch.view === "compact" ? "Expand Momo" : "Shrink Momo"} title={ch.view === "compact" ? "Expand" : "Shrink"}>{ch.view === "compact" ? "⤢" : "⤡"}</button>
+        </div>
+      )}
+      <div className={`pill ${bar.phase} ${bar.mode}`} role="status" aria-live="polite" data-expression={expression}>
         {bar.phase === "idle" && <span className="idle-dots" aria-label="Momo is ready"><i /><i /><i /></span>}
         {bar.phase === "listening" && (<><span className="rec" aria-hidden="true" /><Waveform levels={levels} /></>)}
         {(bar.phase === "transcribing" || bar.phase === "polishing" || bar.phase === "thinking") && (
           <>
-            <span className="shimmer">{bar.message}</span>
-            {bar.phase === "thinking" && <button className="stop" onClick={cancelTask} aria-label="Cancel">✕</button>}
+            <span className="shimmer">{shown.message}</span>
+            {bar.phase === "thinking" && <button data-hit className="stop" onClick={cancelTask} aria-label="Cancel">✕</button>}
           </>
         )}
-        {bar.phase === "confirming" && (<><span className="icon ask" aria-hidden="true">?</span><span className="text">{bar.message}</span></>)}
-        {bar.phase === "asking" && (<><span className="icon ask" aria-hidden="true">?</span><span className="text">{bar.message}</span></>)}
-        {bar.phase === "done" && (<><span className="icon ok" aria-hidden="true">✓</span><span className="text">{bar.message}</span></>)}
-        {bar.phase === "problem" && (<><span className="icon warn" aria-hidden="true">!</span><span className="text">{bar.message}</span></>)}
+        {bar.phase === "confirming" && (<><span className="icon ask" aria-hidden="true">?</span><span className="text">{shown.message}</span></>)}
+        {bar.phase === "asking" && (<><span className="icon ask" aria-hidden="true">?</span><span className="text">{shown.message}</span></>)}
+        {bar.phase === "done" && (<><span className="icon ok" aria-hidden="true">✓</span><span className="text">{shown.message}</span></>)}
+        {bar.phase === "problem" && (<><span className="icon warn" aria-hidden="true">!</span><span className="text">{shown.message}</span></>)}
       </div>
       {!card && (bar.phase === "done" || bar.phase === "problem") && bar.detail && <div className="detail">{bar.detail}</div>}
     </div>

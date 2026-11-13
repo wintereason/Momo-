@@ -10,8 +10,14 @@ export interface WindowInfo {
   active: boolean;
   /** this window belongs to Momo itself */
   isMomo: boolean;
+  /** how it is shown: "minimized" (only a taskbar button), "maximized" or "normal" */
+  state?: "minimized" | "maximized" | "normal";
+  /** 0 = in front of everything; larger = further back (unknown windows sort last) */
+  z?: number;
 }
 export interface DesktopSnapshot {
+  /** every running program (lower case), windows or not */
+  processes?: string[];
   windows: WindowInfo[];
   active: WindowInfo | null;
 }
@@ -48,6 +54,8 @@ export class DesktopAgent {
       title: sanitizeTitle(w.title),
       active: exact ? w.hwnd === raw.activeHwnd : raw.activePid !== null && w.pid === raw.activePid,
       isMomo: mine.has(w.pid),
+      state: w.minimized ? "minimized" : w.maximized ? "maximized" : "normal",
+      z: typeof w.z === "number" ? w.z : 999,
     }));
     const activeCount = windows.filter((w) => w.active).length;
     // the window set was just re-observed: replace the old picture instead of mixing it with it
@@ -66,6 +74,6 @@ export class DesktopAgent {
         confidence: w.active && !exact && activeCount > 1 ? 0.6 : w.active && !exact ? 0.85 : 0.95,
       });
     }
-    return { windows, active };
+    return { windows, active, processes: raw.processes?.map((p) => sanitizeTitle(p).toLowerCase()) };
   }
 }

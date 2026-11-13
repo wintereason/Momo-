@@ -44,6 +44,9 @@ type Pending =
  * It never takes the AI's word for anything: the AI only names tools, and every call is validated, gated and verified here.
  * There are no per-task handlers: what Momo can do is exactly what its tools can do, and the planner combines them.
  */
+/** Tools whose result is a window that has just appeared or come forward. */
+const OPENING_TOOLS = new Set(["open_path", "open_app", "open_url", "switch_tab"]);
+
 export class Orchestrator {
   private seq = 0;
   private generation = 0;
@@ -140,7 +143,7 @@ export class Orchestrator {
 
   private async pursue(task: Task, live: () => boolean): Promise<void> {
     const ai = this.d.ai;
-    const maxSteps = this.d.maxSteps ?? 10;
+    const maxSteps = this.d.maxSteps ?? 16;
     while (live()) {
       if (task.moves >= maxSteps) {
         this.emit({ type: "task.failed", taskId: task.id, recoverable: true, summary: `I couldn't finish that in ${maxSteps} steps, so I stopped instead of going round in circles. Try a smaller request.` });
@@ -220,7 +223,10 @@ export class Orchestrator {
 
   /** Gate, act, verify, observe. "continue" = ask the planner for the next move; anything else = the loop is suspended or over. */
   private async attempt(task: Task, call: Call, live: () => boolean): Promise<"continue" | "suspended" | "stop"> {
-    const ctx = { d: this.d, live, confirmed: call.confirmed, lock: call.lock };
+    // did this step point at something on screen? Then the shadow cursor is told how it ENDED (below), and only then
+    let pointed = false;
+    const d = { ...this.d, emit: (e: Parameters<AgentDeps["emit"]>[0]) => { if (e.type === "cursor.aim" || e.type === "cursor.move" || e.type === "cursor.window") pointed = true; this.d.emit(e); } };
+    const ctx = { d, live, confirmed: call.confirmed, lock: call.lock };
     if (!call.confirmed && decide({ risk: this.riskOf(call) }, this.d.policy()) === "confirm") {
       this.askConfirmation(task, call, await call.tool.describe(call.args, ctx));
       return "suspended";
@@ -231,10 +237,20 @@ export class Orchestrator {
     let out: ToolOutcome;
     try { out = await call.tool.run(call.args, ctx); } catch { out = { ok: false, reason: "That step hit an unexpected problem." }; }
     if (!live()) return "stop";
+    // the verdict on the shadow cursor is tied to the verification result: verified = confirmed; ok but not verified = NOT confirmed; else failed
+    if (pointed) {
+      if (out.ok) this.emit({ type: "cursor.result", state: out.verified ? "verified" : "unconfirmed", text: (out.verified ? (out.shown ?? "Confirmed") : "Not confirmed").slice(0, 100) });
+      else if (!("needsConfirmation" in out) && !("ambiguous" in out) && out.reason !== "cancelled") this.emit({ type: "cursor.result", state: "failed", text: out.reason.slice(0, 90) });
+    }
     const base = call.tool.risk(call.args);
     const isAction = base === "reversible" || base === "consequential"; // changed something on the PC
 
     if (out.ok) {
+      // after opening something, the shadow cursor glides to the window that appeared
+      if (out.verified && OPENING_TOOLS.has(call.tool.name)) {
+        const fg = this.d.foreground?.lastExternal();
+        if (fg) this.emit({ type: "cursor.window", hwnd: fg.hwnd, action: "open", label: fg.title.slice(0, 60) });
+      }
       if (isAction) { task.epoch++; this.d.world.notify("focus_changed"); } // what was observed before may no longer be true
       task.ran++;
       if (!out.verified) { task.unverified++; if (isAction) task.unverifiedActions.add(`${call.tool.name}:${JSON.stringify(call.args)}`); }

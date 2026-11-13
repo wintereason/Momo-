@@ -3,7 +3,7 @@ import { ActionAgent } from "../action";
 import { DesktopAgent } from "../desktop";
 import { FileSystemAgent } from "../filesystem";
 import { Orchestrator } from "./agent";
-import type { ActionPort, AppsPort, ForegroundPort, FsPort, InputPort, LaunchPort, ScreenPort, WindowsPort } from "../shared/ports";
+import type { ActionPort, AppsPort, ForegroundPort, FsPort, InputPort, LaunchPort, PointerPort, ScreenPort, WindowsPort } from "../shared/ports";
 import { AppAgent } from "../apps";
 import type { AiService } from "./ai/service";
 import { UiPanelAgent } from "../uipanel";
@@ -36,6 +36,10 @@ export interface SessionDeps {
   taskTimeoutMs?: number;
   verifyAttempts?: number;
   maxSteps?: number;
+  /** how long the shadow cursor gets to glide to a control before Momo acts on it (0 when it is switched off) */
+  cursorLeadMs?: () => number;
+  /** the real mouse and keyboard for human-like control; returns undefined when it is off */
+  pointer?: () => PointerPort | undefined;
 }
 
 /**
@@ -74,7 +78,7 @@ export class Session {
       world: this.world, fsAgent: this.fsAgent, desktopAgent: this.desktopAgent, actionAgent: this.actionAgent,
       uiAgent: this.uiAgent, visualAgent: this.visualAgent, appAgent: this.appAgent, foreground: deps.foreground, ai: deps.ai,
       verifier: new Verifier(), fs: deps.fs, policy: () => this.policy,
-      sleep: deps.sleep, confirmTimeoutMs: deps.confirmTimeoutMs, taskTimeoutMs: deps.taskTimeoutMs, verifyAttempts: deps.verifyAttempts, maxSteps: deps.maxSteps,
+      sleep: deps.sleep, confirmTimeoutMs: deps.confirmTimeoutMs, taskTimeoutMs: deps.taskTimeoutMs, verifyAttempts: deps.verifyAttempts, maxSteps: deps.maxSteps, cursorLeadMs: deps.cursorLeadMs, pointer: deps.pointer,
       emit: (e) => { if (!this.disposed) deps.emit(e); },
     });
   }

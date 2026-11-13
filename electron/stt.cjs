@@ -4,7 +4,8 @@ const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
 
-const MODEL_DIR = ["Xenova", "whisper-base"];
+// whisper-small: much better than base for Hindi and other non-English languages (about 250 MB, downloaded once)
+const DEFAULT_MODEL = "Xenova/whisper-small";
 const MODEL_FILES = [["config.json"], ["onnx", "encoder_model_quantized.onnx"], ["onnx", "decoder_model_merged_quantized.onnx"]];
 const MAX_SAMPLES = 16000 * 60; // one minute of 16 kHz audio
 
@@ -12,6 +13,8 @@ const MAX_SAMPLES = 16000 * 60; // one minute of 16 kHz audio
  * @param {{ cacheDir: string, workerPath: string, idleMs?: number, WorkerClass?: any, cores?: number }} o
  */
 function createStt(o) {
+  const modelId = o.model || DEFAULT_MODEL;
+  const MODEL_DIR = modelId.split("/");
   const idleMs = o.idleMs ?? 5 * 60_000;
   const WorkerClass = o.WorkerClass || require("node:worker_threads").Worker;
   let worker = null;
@@ -56,7 +59,7 @@ function createStt(o) {
     lastError = "";
     files.clear();
     loading = new Promise((resolve, reject) => {
-      const w = new WorkerClass(o.workerPath, { workerData: { cacheDir: o.cacheDir, cores: o.cores ?? os.cpus().length } });
+      const w = new WorkerClass(o.workerPath, { workerData: { cacheDir: o.cacheDir, cores: o.cores ?? os.cpus().length, model: modelId } });
       worker = w;
       w.on("message", (m) => {
         if (m.type === "progress") progress(m.p);
@@ -76,10 +79,25 @@ function createStt(o) {
     return loading;
   }
 
+  // Loading with retries: files that were already downloaded stay in the cache, so each new try continues where the last stopped.
+  const sleepMs = o.sleep || ((ms) => new Promise((r) => setTimeout(r, ms)));
+  async function loadWithRetry(cb) {
+    const tries = o.loadTries ?? 5;
+    let err;
+    for (let i = 0; i < tries; i++) {
+      try { return await load(cb); } catch (e) {
+        err = e;
+        if (!/fet[c]h failed|ECONN|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|network|socket|terminated/i.test(String((e && e.message) || e))) break; // not a network problem
+        await sleepMs(1500 * (i + 1));
+      }
+    }
+    throw err;
+  }
+
   async function transcribe(audio, language = "en") {
     if (!(audio instanceof Float32Array) || audio.length === 0 || audio.length > MAX_SAMPLES) throw new Error("bad audio");
-    if (!/^[a-z]{2,3}$/.test(language)) throw new Error("bad language");
-    await load();
+    if (!/^([a-z]{2,3}|auto)$/.test(language)) throw new Error("bad language");
+    await loadWithRetry();
     clearIdle();
     const id = ++seq;
     return new Promise((resolve, reject) => {
@@ -101,7 +119,7 @@ function createStt(o) {
 
   return {
     isCached,
-    load,
+    load: loadWithRetry,
     transcribe,
     unload,
     status: () => ({ cached: isCached(), state, lastError }),

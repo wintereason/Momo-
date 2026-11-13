@@ -21,6 +21,7 @@ const KEYS = {
   OLLAMA_HOST: { group: "ai", kind: "setting", check: /^https?:\/\/(localhost|127\.0\.0\.1)(:\d{1,5})?\/?$/i, hint: "must be a local address like http://localhost:11434" },
   MOMO_AI_MODEL_FAST: { group: "ai", kind: "setting", check: /^[A-Za-z0-9._:/-]{1,100}$/, hint: "is not a valid model name" },
   MOMO_AI_MODEL_SMART: { group: "ai", kind: "setting", check: /^[A-Za-z0-9._:/-]{1,100}$/, hint: "is not a valid model name" },
+  MOMO_AI_MODEL_VISION: { group: "ai", kind: "setting", check: /^[A-Za-z0-9._:/-]{1,100}$/, hint: "is not a valid model name" },
   MOMO_AI_MAX_OUTPUT_TOKENS: { group: "ai", kind: "setting", check: /^\d{2,5}$/, hint: "must be a whole number" },
   MOMO_AI_MAX_REQUESTS_PER_DAY: { group: "ai", kind: "setting", check: /^\d{1,5}$/, hint: "must be a whole number" },
   MOMO_AI_ALLOW_SCREEN_CONTEXT: { group: "ai", kind: "setting", check: /^(true|false)$/i, hint: "must be true or false" },
@@ -107,4 +108,44 @@ function status(values, files = []) {
   };
 }
 
-module.exports = { KEYS, PROVIDERS, parse, load, problems, status };
+// What the Settings page may change. Everything else in the file is left exactly as it is.
+const EDITABLE = ["MOMO_AI_ENABLED", "MOMO_AI_PROVIDER", "GEMINI_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY", "OLLAMA_HOST", "HF_TOKEN"];
+
+/**
+ * Write-only update of the .env file from the Settings page. updates: { KEY: "value" } where "" removes the setting.
+ * Each value is checked against the same rule used for reading BEFORE anything is written. Other lines (comments, other
+ * keys) are kept. Returns only { ok, problems } where problems never contain a value.
+ */
+function save(file, updates) {
+  const bad = [];
+  const clean = {};
+  for (const [k, raw] of Object.entries(updates || {})) {
+    if (!EDITABLE.includes(k)) { bad.push(k + " can't be changed here."); continue; }
+    const v = String(raw ?? "").trim();
+    if (/[\r\n]/.test(v)) { bad.push(k + " must be on one line."); continue; }
+    if (v && !KEYS[k].check.test(v)) { bad.push(k + " " + KEYS[k].hint + "."); continue; }
+    clean[k] = v;
+  }
+  if (bad.length) return { ok: false, problems: bad };
+  let lines = [];
+  try { lines = fs.readFileSync(file, "utf8").split(/\r?\n/); } catch { /* a new file */ }
+  const done = new Set();
+  const out = [];
+  for (const line of lines) {
+    const m = line.match(/^\s*([A-Z][A-Z0-9_]*)\s*=/);
+    if (m && m[1] in clean) {
+      if (done.has(m[1])) continue; // drop duplicates of a key we are setting
+      done.add(m[1]);
+      if (clean[m[1]] !== "") out.push(m[1] + "=" + clean[m[1]]); // "" removes the line
+    } else out.push(line);
+  }
+  while (out.length && out[out.length - 1] === "") out.pop();
+  for (const [k, v] of Object.entries(clean)) if (!done.has(k) && v !== "") out.push(k + "=" + v);
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, out.join("\n") + "\n", "utf8");
+  } catch { return { ok: false, problems: ["Momo couldn't write its settings file."] }; }
+  return { ok: true, problems: [] };
+}
+
+module.exports = { KEYS, EDITABLE, PROVIDERS, parse, load, problems, status, save };

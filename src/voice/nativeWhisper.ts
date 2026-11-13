@@ -33,9 +33,10 @@ export class NativeWhisperClient implements SpeechClient {
     return this.loading;
   }
 
-  async transcribe(audio: Float32Array, language = "en"): Promise<string> {
-    await this.load();
-    const r = await this.shell.sttTranscribe(audio, language);
+  async transcribe(audio: Float32Array, language = "en", engine: "local" | "cloud" = "local"): Promise<string> {
+    // cloud speech needs no local model (the shell falls back to it by itself if the cloud is unreachable)
+    if (engine !== "cloud") await this.load();
+    const r = await this.shell.sttTranscribe(audio, language, engine);
     if (!r.ok) {
       // the shell may have released the model after idle time: the next call loads it again
       this.set("idle");

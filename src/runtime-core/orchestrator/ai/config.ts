@@ -13,6 +13,8 @@ export interface ProviderEntry {
   host?: string;
   modelFast: string;
   modelSmart: string;
+  /** a model that can LOOK at a picture; absent = this provider cannot be used for pictures */
+  modelVision?: string;
 }
 
 export interface AiConfig {
@@ -26,13 +28,13 @@ export interface AiConfig {
 }
 
 /** Free-tier models that exist on each service (checked against the live model lists). */
-export const DEFAULT_MODELS: Record<Provider, { fast: string; smart: string }> = {
+export const DEFAULT_MODELS: Record<Provider, { fast: string; smart: string; vision?: string }> = {
   // Rolling aliases, not version numbers: Google retires versions for new accounts (2.5 already is), the alias keeps working.
   // The larger "gemini-flash-latest" stalls on the free tier (verified live), so both tiers use the lite model.
-  gemini: { fast: "gemini-flash-lite-latest", smart: "gemini-flash-lite-latest" },
-  groq: { fast: "openai/gpt-oss-20b", smart: "openai/gpt-oss-120b" },
+  gemini: { fast: "gemini-flash-lite-latest", smart: "gemini-flash-lite-latest", vision: "gemini-flash-lite-latest" },
+  groq: { fast: "openai/gpt-oss-20b", smart: "openai/gpt-oss-120b", vision: "meta-llama/llama-4-scout-17b-16e-instruct" },
   openrouter: { fast: "openrouter/free", smart: "openrouter/free" },
-  ollama: { fast: "llama3.2", smart: "llama3.2" },
+  ollama: { fast: "llama3.2", smart: "llama3.2", vision: "llava" },
 };
 
 export const isCloud = (p: Provider): boolean => p !== "ollama";
@@ -53,6 +55,7 @@ export function buildAiConfig(values: Record<string, string | undefined>): AiCon
       provider: p,
       modelFast: (overrides && values.MOMO_AI_MODEL_FAST) || d.fast,
       modelSmart: (overrides && values.MOMO_AI_MODEL_SMART) || d.smart,
+      modelVision: (overrides && values.MOMO_AI_MODEL_VISION) || d.vision,
     };
     if (p === "ollama") return values.OLLAMA_HOST ? { ...base, host: values.OLLAMA_HOST.replace(/\/$/, "") } : null;
     return keys[p] ? { ...base, key: keys[p] } : null;

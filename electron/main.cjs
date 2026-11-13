@@ -7,7 +7,9 @@ const { uIOhook, UiohookKey } = require("uiohook-napi");
 const { ChordTracker, toAccelerator } = require("./chord.cjs");
 const { makeAllowedRequest } = require("./netpolicy.cjs");
 const { createInserter, createWinKeys } = require("./insert.cjs");
+const { createTargeting } = require("./targeting.cjs");
 const { createStt } = require("./stt.cjs");
+const { transcribeCloud } = require("./cloudStt.cjs");
 const appProtocol = require("./appProtocol.cjs");
 const envConfig = require("./env.cjs");
 const path = require("node:path");
@@ -49,8 +51,11 @@ function lockDown(w) {
 
 // ---- The bar: a passive indicator at the bottom centre of the screen. It never takes focus (so the text goes to the
 // app you were in) and never catches clicks.
-const BAR = { width: 560, height: 260, gap: 10 };
+const BAR_SIZES = { compact: { width: 560, height: 440 }, expanded: { width: 560, height: 700 } };
+let barView = "compact";
+const BAR = { ...BAR_SIZES.compact, gap: 10 };
 function placeBar() {
+  BAR.width = BAR_SIZES[barView].width; BAR.height = BAR_SIZES[barView].height;
   if (!barWin || barWin.isDestroyed()) return;
   const wa = screen.getPrimaryDisplay().workArea;
   barWin.setBounds({
@@ -133,6 +138,12 @@ ipcMain.on("momo:bar-interactive", (e, on) => {
   if (!fromBar(e) || typeof on !== "boolean" || !barWin || barWin.isDestroyed()) return;
   barWin.setIgnoreMouseEvents(!on, { forward: true });
 });
+// Compact (a small face above the pill) or expanded (the character, larger). The window stays transparent and click-through.
+ipcMain.on("momo:bar-layout", (e, view) => {
+  if (!fromBar(e) || (view !== "compact" && view !== "expanded")) return;
+  barView = view;
+  placeBar();
+});
 ipcMain.on("momo:quit", (e) => { if (fromOurWindow(e)) app.quit(); });
 
 // ---- Which window was the user in before they turned to Momo? (so "read this window" means THAT window)
@@ -169,9 +180,70 @@ function startForegroundTracker() {
   }
 }
 
+// ---- The shadow cursor: a ghost pointer that shows where Momo is acting. A transparent, click-through window that is
+// hidden unless a task is running (see shadowCursor.cjs). It never moves the real mouse and never clicks.
+let shadowOn = true;
+let shadow = null;
+function getShadow() {
+  if (!shadow) {
+    const { createCursorWindow, createCursorScreen } = require("./cursorWindow.cjs");
+    shadow = require("./shadowCursor.cjs").createShadowCursor({
+      enabled: () => shadowOn,
+      win: createCursorWindow({ BrowserWindow, webPreferences: secureWebPreferences, lockDown, url: pageUrl("cursor") }),
+      screen: createCursorScreen(screen, require("koffi")),
+    });
+  }
+  return shadow;
+}
+// ---- Human-like control: the real mouse and keyboard (humanInput.cjs). Off = Momo acts only through UI Automation.
+let humanOn = true;
+let pointer = null;
+let lastTaskId = null;
+let taskWorking = false; // a task is running right now (the pointer is created lazily, after "working" was announced)
+function getPointer() {
+  if (!pointer) {
+    pointer = require("./humanInput.cjs").createPointer(require("koffi"), {
+      // the ghost sits exactly where the REAL pointer is, at every step, so the two can never drift apart
+      onTrack: (t) => { try { getShadow().track(t); } catch { /* decoration */ } },
+      // THE USER ALWAYS WINS: they moved the physical mouse or pressed Esc. Stop the whole task now, not just this click.
+      onInterrupt: (reason) => {
+        try { getShadow().stop(reason); } catch { /* decoration */ }
+        try { runtime?.cancelTask(); } catch { /* ignore */ }
+        try { pointer?.disarm(); } catch { /* ignore */ }
+        if (lastTaskId) broadcast("momo:runtime-event", { type: "task.failed", taskId: lastTaskId, summary: reason === "esc" ? "Stopped: you pressed Esc." : "Stopped: you moved the mouse.", recoverable: true });
+      },
+    });
+    if (taskWorking) pointer.arm();
+  }
+  return pointer;
+}
+/** the watchdog runs only while a task is working: not while Momo is waiting for you to answer a question or press Confirm */
+function pointerLifecycle(event) {
+  if (!event || typeof event !== "object") return;
+  switch (event.type) {
+    case "task.state":
+      taskWorking = event.state === "working";
+      if (pointer) { if (taskWorking) pointer.arm(); else pointer.disarm(); }
+      break;
+    case "task.completed": case "task.failed": case "task.answer": case "task.confirmation_required": case "task.clarification_required":
+      taskWorking = false;
+      if (pointer) pointer.disarm();
+      break;
+    default: break;
+  }
+}
+ipcMain.on("momo:set-human-input", (e, on) => {
+  if (!fromOurWindow(e) || typeof on !== "boolean") return;
+  humanOn = on;
+});
+ipcMain.on("momo:set-shadow-cursor", (e, on) => {
+  if (!fromOurWindow(e) || typeof on !== "boolean") return;
+  shadowOn = on;
+  if (!on) shadow?.cancel();
+});
+
 // ---- Runtime: the AI helper, the "Ask Momo" commands (typed in Settings) and dictation clean-up.
 let runtime = null;
-let focusRuntime = null; // focusedFieldIsPassword from the runtime bundle
 function broadcast(channel, payload) {
   for (const w of [barWin, settingsWin]) if (w && !w.isDestroyed()) w.webContents.send(channel, payload);
 }
@@ -181,14 +253,20 @@ function sendToSettings(channel, payload) {
 function startRuntime() {
   try {
     const rt = require("./runtime.cjs");
-    focusRuntime = rt.focusedFieldIsPassword;
     startForegroundTracker();
     readEnv(); // API keys and settings from .env: they stay in this process
     runtime = rt.createRuntime({
       // The AI brain. The config is rebuilt on every use, so editing .env and clicking "Re-read .env" takes effect at once.
       ai: { config: () => rt.buildAiConfig(envValues), usage: aiUsage },
       foreground: { lastExternal: () => lastExternal },
-      emit: (event) => broadcast("momo:runtime-event", event),
+      pointer: () => { if (!humanOn) return undefined; try { return getPointer(); } catch { return undefined; } },
+      cursorLeadMs: () => (shadowOn ? 800 : 0), // let the ghost arrive before Momo acts, so you see what is about to happen
+      emit: (event) => {
+        if (event && typeof event.taskId === "string") lastTaskId = event.taskId;
+        broadcast("momo:runtime-event", event);
+        try { pointerLifecycle(event); } catch { /* ignore */ }
+        try { getShadow().handle(event); } catch { /* the cursor is decoration: never let it break a task */ }
+      },
       // Momo's own processes, so it can tell its window apart from the user's
       selfPids: () => app.getAppMetrics().map((m) => m.pid),
       // The only thing Momo can do to the PC from a command: open a folder. The runtime validates the path and asks first.
@@ -206,7 +284,7 @@ ipcMain.on("momo:submit-transcript", (e, p) => {
   }
   void runtime.handleTranscript(p.sessionId.slice(0, 128), p.text.slice(0, 2000));
 });
-ipcMain.on("momo:cancel-task", (e) => { if (fromOurWindow(e)) runtime?.cancelTask(); });
+ipcMain.on("momo:cancel-task", (e) => { if (fromOurWindow(e)) { runtime?.cancelTask(); pointer?.disarm(); shadow?.cancel(); } });
 // The Confirm/Cancel buttons. The runtime ignores ids that don't match the question that is actually open.
 ipcMain.on("momo:respond-confirmation", (e, p) => {
   if (!fromOurWindow(e) || !p || typeof p.taskId !== "string" || typeof p.approved !== "boolean") return;
@@ -234,25 +312,71 @@ ipcMain.handle("momo:stt-load", async (e) => {
 });
 ipcMain.handle("momo:stt-transcribe", async (e, p) => {
   if (!fromBar(e)) return { ok: false, reason: "Not allowed." };
-  if (!p || !(p.audio instanceof Float32Array) || typeof p.language !== "string") return { ok: false, reason: "Bad request." };
+  if (!p || !(p.audio instanceof Float32Array) || typeof p.language !== "string" || !/^([a-z]{2,3}|auto)$/.test(p.language)) return { ok: false, reason: "Bad request." };
+  let note;
+  // Cloud speech (only when the user chose it and a Groq key is set): the most accurate. If it fails (offline, limit), use the local model.
+  if (p.engine === "cloud") {
+    try {
+      const text = await transcribeCloud({ key: envValues.GROQ_API_KEY, audio: p.audio.slice(), language: p.language });
+      return { ok: true, text, engine: "cloud" };
+    } catch (err) {
+      note = String((err && err.message) || err).slice(0, 200);
+      if (!getStt().isCached()) return { ok: false, reason: note };
+    }
+  }
   try {
-    return { ok: true, text: await getStt().transcribe(p.audio, p.language) };
+    return { ok: true, text: await getStt().transcribe(p.audio, p.language), engine: "local", note };
   } catch {
     return { ok: false, reason: "The speech engine could not read that." };
   }
 });
 
-// ---- Dictation: what was said -> clean text -> typed into the app that has the focus.
+// ---- Dictation: what was said -> clean text -> written into a field that was FOUND, FOCUSED and CHECKED (see targeting.cjs).
 let inserter = null;
 function getInserter() {
   if (!inserter) inserter = createInserter({ clipboard, keys: createWinKeys(require("koffi")) });
   return inserter;
 }
-// Started when the user begins to speak, so the answer is ready long before they finish.
-let passwordCheck = null;
+let foregroundFn = null;
+function foregroundWindow() {
+  try {
+    if (!foregroundFn) {
+      const user32 = require("koffi").load("user32.dll");
+      foregroundFn = user32.func("void* __stdcall GetForegroundWindow()");
+    }
+    const h = foregroundFn();
+    return h ? { hwnd: Number(require("koffi").address(h)) } : null;
+  } catch { return null; }
+}
+let targeting = null;
+function getTargeting() {
+  if (!targeting) {
+    const rt = require("./runtime.cjs");
+    targeting = createTargeting({ uia: rt, foreground: foregroundWindow, inserter: getInserter() });
+  }
+  return targeting;
+}
+// The ONLY place Momo writes the clipboard from the shell: text the user dictated (never text read from the screen).
+function copyDictated(dictatedText) { clipboard.writeText(dictatedText); }
+let lastBase = {}; // how the last text was produced (shown in the bar's detail line); the text itself is not kept here
+// Turns what the targeting layer reports into the answer the bar understands.
+function dictationAnswer(t, base) {
+  const a = { ok: true, ...base, inserted: false, copied: false };
+  if (t.kind === "choose") return { ...a, needs: "choose", options: t.options };
+  if (t.kind === "click") return { ...a, needs: "click" };
+  if (t.kind === "cancelled") return { ...a, cancelled: true };
+  if (t.kind === "blocked") {
+    if (t.reason === "no_field" && typeof t.text === "string") { copyDictated(t.text); return { ...a, copied: true, blocked: "no_field" }; }
+    return { ...a, copied: !!t.copied, blocked: t.reason };
+  }
+  // inserted: the paste was sent into the verified field; "verified" says whether the text was seen arriving
+  if (t.verification === "failed") return { ...a, copied: true, blocked: "not_confirmed", field: t.field };
+  return { ...a, inserted: true, copied: true, verified: t.verification, field: t.field, collapsedSelection: t.collapsedSelection };
+}
+// Started when the user begins to speak: look at the window in front while they talk, so the answer is ready when they finish.
 ipcMain.on("momo:dictation-begin", (e) => {
   if (!fromBar(e)) return;
-  passwordCheck = focusRuntime ? focusRuntime().catch(() => "unknown") : Promise.resolve("unknown");
+  try { getTargeting().begin(); } catch { /* the runtime is not built yet: dictate will say so */ }
 });
 ipcMain.handle("momo:dictate", async (e, p) => {
   if (!fromBar(e)) return { ok: false, reason: "Not allowed." };
@@ -262,19 +386,31 @@ ipcMain.handle("momo:dictate", async (e, p) => {
   if (!runtime) return { ok: false, reason: "Momo's runtime isn't running." };
   const out = await runtime.dictate(p.text.slice(0, 4000), style);
   if (!out.ok) return out;
-  const result = { ok: true, text: out.text, polished: out.polished, source: out.source, note: out.note, inserted: false, copied: false };
+  lastBase = { text: out.text, polished: out.polished, source: out.source, note: out.note };
   if (mode === "copy") {
-    clipboard.writeText(out.text);
-    return { ...result, copied: true };
+    copyDictated(out.text);
+    return { ok: true, ...lastBase, inserted: false, copied: true };
   }
-  // Never type into a password box.
-  const pw = passwordCheck ? await passwordCheck : "unknown";
-  passwordCheck = null;
-  if (pw === "yes") return { ...result, blocked: "password" };
-  const r = await getInserter().insert(out.text, { restoreClipboard: p.restoreClipboard === true });
-  if (r.ok) return { ...result, inserted: true, copied: true };
-  return { ...result, copied: r.copied, blocked: r.reason };
+  const base = lastBase;
+  lastBase = { polished: out.polished, source: out.source, note: out.note };
+  try {
+    return dictationAnswer(await getTargeting().deliver(out.text, { restoreClipboard: p.restoreClipboard === true }), base);
+  } catch {
+    copyDictated(out.text);
+    return { ok: true, ...base, inserted: false, copied: true, blocked: "no_field" };
+  }
 });
+// The user picked one of the fields Momo listed.
+ipcMain.handle("momo:dictation-pick", async (e, p) => {
+  if (!fromBar(e)) return { ok: false, reason: "Not allowed." };
+  try { return dictationAnswer(await getTargeting().pick(p && p.id), lastBase); } catch { return { ok: false, reason: "I couldn't write that." }; }
+});
+// "Click inside a text box": resolves once the user has put the cursor in one (and the text is written there), or on timeout.
+ipcMain.handle("momo:dictation-wait-click", async (e) => {
+  if (!fromBar(e)) return { ok: false, reason: "Not allowed." };
+  try { return dictationAnswer(await getTargeting().waitForClick(), lastBase); } catch { return { ok: false, reason: "I couldn't write that." }; }
+});
+ipcMain.on("momo:dictation-cancel", (e) => { if (fromBar(e)) targeting?.cancel(); });
 
 // ---- API keys and settings from the .env file. Values stay in THIS process; the UI only gets booleans (env.cjs).
 let envValues = {};
@@ -313,6 +449,12 @@ function readEnv() {
   return s;
 }
 ipcMain.handle("momo:env-status", (e) => (fromOurWindow(e) ? readEnv() : null));
+// Write-only: the page sends a key it just typed; it is checked and saved, and only the yes/no status comes back.
+ipcMain.handle("momo:env-save", (e, updates) => {
+  if (!fromOurWindow(e) || !updates || typeof updates !== "object") return { ok: false, problems: ["Not allowed."], status: null };
+  const r = envConfig.save(path.join(app.getPath("userData"), ".env"), updates);
+  return { ...r, status: readEnv() };
+});
 
 // "Delete everything Momo stored on this PC": the AI request counter plus ALL Chromium storage
 // (settings, the downloaded speech model, caches). The UI removes its own preferences first.
@@ -421,8 +563,23 @@ app.whenReady().then(() => {
   startRuntime();
   screen.on("display-metrics-changed", placeBar);
   // Starting Momo opens its Settings window (the app); the bar lives at the bottom of the screen.
-  openSettings();
+  // Started by Windows at sign-in: stay quietly in the tray (the shortcut already works). Started by the user: open Settings.
+  if (!process.argv.includes("--hidden")) openSettings();
+  firstRunAutostart();
 });
+
+// ---- Start with Windows. The first time the installed app runs, it is switched on (the user can turn it off in Settings).
+const loginArgs = ["--hidden"];
+const autostartOn = () => { try { return app.getLoginItemSettings({ args: loginArgs }).openAtLogin; } catch { return false; } };
+function setAutostart(on) { try { app.setLoginItemSettings({ openAtLogin: on, args: loginArgs }); } catch { /* not supported here */ } return autostartOn(); }
+function firstRunAutostart() {
+  if (!app.isPackaged) return; // never register the development copy
+  const mark = path.join(app.getPath("userData"), "autostart-asked");
+  try { if (fs.existsSync(mark)) return; fs.writeFileSync(mark, "1"); } catch { return; }
+  setAutostart(true);
+}
+ipcMain.handle("momo:autostart-get", (e) => (fromOurWindow(e) ? autostartOn() : false));
+ipcMain.handle("momo:autostart-set", (e, on) => (fromOurWindow(e) && app.isPackaged ? setAutostart(on === true) : false));
 
 app.on("second-instance", () => openSettings());
 // Closing Settings leaves the bar running (like a tray app); Quit is in the tray menu and in Settings.
@@ -434,7 +591,7 @@ app.on("before-quit", () => {
   stt?.unload();
   if (foregroundTimer) clearInterval(foregroundTimer);
   lastExternal = null;
-  passwordCheck = null;
+  targeting?.cancel();
   for (const role of ROLES) clearShortcut(role);
   globalShortcut.unregisterAll();
   try { uIOhook.stop(); } catch { /* not started */ }

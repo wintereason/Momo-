@@ -1,0 +1,63 @@
+/* The shadow cursor overlay: fully transparent, never takes the mouse. */
+html.cursor-route, html.cursor-route body, html.cursor-route #root { background: transparent !important; margin: 0; overflow: hidden; height: 100%; }
+.shadow { position: fixed; inset: 0; pointer-events: none; font-family: "Segoe UI Variable", "Segoe UI", system-ui, sans-serif; transition: opacity .5s ease; opacity: 1; }
+.shadow.fade { opacity: 0; }
+
+/* the ghost glides between places on its own (UI Automation actions); .drift is only a gentle idle sway so it never looks frozen */
+.ghost { position: absolute; left: 0; top: 0; transition: transform .8s cubic-bezier(.35, .05, .2, 1); filter: drop-shadow(0 4px 10px rgba(232, 88, 140, .45)); will-change: transform; }
+.ghost.snap { transition: none; }
+/* human-like control: the ghost sits exactly where the REAL pointer is, updated many times a second: no easing of its own, so it cannot lag or drift */
+.ghost.follow { transition: none; margin: -2.9px 0 0 -4.7px; } /* the arrow's tip is at (4.7, 2.9) inside its box: shift so the TIP is on the real pointer's hotspot */
+.drift { position: relative; animation: sway 3.2s ease-in-out infinite; }
+.ghost.follow > div { position: relative; }
+.arrow { display: block; transform-origin: 4px 3px; }
+.arrow.press { animation: press .55s ease-out; }
+.tag { position: absolute; left: 26px; top: 22px; white-space: nowrap; background: rgba(24, 22, 28, .92); color: #fff; font-size: 12.5px; font-weight: 500; padding: 4px 10px; border-radius: 999px; box-shadow: 0 0 0 1px rgba(255, 255, 255, .14) inset; max-width: 420px; overflow: hidden; text-overflow: ellipsis; }
+.tag.good { background: #1f7a45; } .tag.warn { background: #9a6a00; } .tag.bad { background: #b3261e; }
+
+/* what the ghost is doing at the target */
+.ring { position: absolute; left: 4px; top: 3px; width: 0; height: 0; border-radius: 50%; border: 2px solid rgba(255, 122, 168, .95); opacity: 0; transform: translate(-50%, -50%); }
+.ring.on { animation: ring .7s ease-out; }
+.halo { position: absolute; left: 4px; top: 3px; width: 26px; height: 26px; border-radius: 50%; background: rgba(255, 122, 168, .28); transform: translate(-50%, -50%); animation: halo .9s ease-in-out infinite; }
+.typing { position: absolute; left: 26px; top: -14px; display: flex; gap: 4px; background: rgba(24, 22, 28, .92); padding: 6px 9px; border-radius: 999px; }
+.typing i { width: 6px; height: 6px; border-radius: 50%; background: #ff8fb3; animation: dot .9s ease-in-out infinite; }
+.typing i:nth-child(2) { animation-delay: .15s; } .typing i:nth-child(3) { animation-delay: .3s; }
+.keycap { position: absolute; left: 26px; top: -18px; background: #fff; color: #231f26; font-weight: 700; font-size: 12.5px; padding: 3px 10px; border-radius: 8px; box-shadow: 0 2px 0 #cfc7cc, 0 4px 12px rgba(0, 0, 0, .25); animation: key .8s ease-out; }
+
+/* the exact element Momo is working on. aim = identified (about to act), hover = the pointer arrived, hit = pressed, wait = checking,
+   ok / unconfirmed / failed = the result, shown only after Momo has verified it */
+.target { position: absolute; border-radius: 10px; border: 2px solid rgba(255, 122, 168, .85); box-shadow: 0 0 0 4px rgba(255, 122, 168, .18); transition: left .35s cubic-bezier(.35, .05, .2, 1), top .35s cubic-bezier(.35, .05, .2, 1), width .3s ease, height .3s ease, background .25s ease, border-color .25s ease, box-shadow .25s ease; }
+.target.idle { animation: glow 1.6s ease-in-out infinite; }
+.target.aim { border-style: dashed; border-color: rgba(120, 140, 255, .95); box-shadow: 0 0 0 5px rgba(120, 140, 255, .18); animation: aim 1s ease-in-out infinite; }
+.target.hover { background: rgba(255, 122, 168, .1); box-shadow: 0 0 0 6px rgba(255, 122, 168, .22); }
+.target.hit { background: rgba(255, 122, 168, .22); }
+.target.wait { border-color: rgba(120, 140, 255, .95); background: rgba(120, 140, 255, .08); animation: glow 1s ease-in-out infinite; }
+.target.ok { border-color: #2f9e5b; background: rgba(47, 158, 91, .14); box-shadow: 0 0 0 5px rgba(47, 158, 91, .22); animation: confirm .6s ease-out; }
+.target.unconfirmed { border-color: #d49100; background: rgba(212, 145, 0, .12); box-shadow: 0 0 0 5px rgba(212, 145, 0, .22); }
+.target.failed { border-color: #d6382f; background: rgba(214, 56, 47, .12); box-shadow: 0 0 0 5px rgba(214, 56, 47, .24); animation: shake .45s ease-in-out; }
+/* a small round badge on the target's corner: dots while checking, then a check, a question mark, or a cross */
+.badge { position: absolute; width: 22px; height: 22px; border-radius: 50%; display: flex; align-items: center; justify-content: center; gap: 2px; color: #fff; font-size: 13px; font-weight: 800; box-shadow: 0 2px 8px rgba(0, 0, 0, .3); animation: pop .35s cubic-bezier(.2, 1.6, .4, 1); }
+.badge.wait { background: #5a6cff; } .badge.wait i { width: 4px; height: 4px; border-radius: 50%; background: #fff; animation: dot .9s ease-in-out infinite; } .badge.wait i:nth-child(2) { animation-delay: .15s; } .badge.wait i:nth-child(3) { animation-delay: .3s; }
+.badge.ok { background: #2f9e5b; } .badge.unconfirmed { background: #d49100; } .badge.failed { background: #d6382f; }
+
+@keyframes sway { 0%, 100% { transform: translate(0, 0); } 25% { transform: translate(5px, -3px); } 50% { transform: translate(1px, 4px); } 75% { transform: translate(-4px, -2px); } }
+@keyframes press { 0% { transform: scale(1); } 30% { transform: scale(.78); } 100% { transform: scale(1); } }
+@keyframes ring { from { width: 0; height: 0; opacity: .95; } to { width: 64px; height: 64px; opacity: 0; } }
+@keyframes halo { 0%, 100% { transform: translate(-50%, -50%) scale(.8); opacity: .5; } 50% { transform: translate(-50%, -50%) scale(1.35); opacity: .9; } }
+@keyframes dot { 0%, 100% { transform: translateY(0); opacity: .5; } 50% { transform: translateY(-3px); opacity: 1; } }
+@keyframes key { 0% { transform: translateY(6px) scale(.9); opacity: 0; } 30% { transform: translateY(0) scale(1); opacity: 1; } 55% { transform: translateY(2px); } 100% { transform: translateY(0); opacity: 1; } }
+@keyframes glow { 0%, 100% { box-shadow: 0 0 0 4px rgba(255, 122, 168, .18); } 50% { box-shadow: 0 0 0 8px rgba(255, 122, 168, .08); } }
+@keyframes aim { 0%, 100% { box-shadow: 0 0 0 4px rgba(120, 140, 255, .22); } 50% { box-shadow: 0 0 0 10px rgba(120, 140, 255, .06); } }
+@keyframes confirm { 0% { transform: scale(1); } 40% { transform: scale(1.04); } 100% { transform: scale(1); } }
+@keyframes shake { 0%, 100% { transform: translateX(0); } 20% { transform: translateX(-5px); } 40% { transform: translateX(5px); } 60% { transform: translateX(-3px); } 80% { transform: translateX(3px); } }
+@keyframes pop { from { transform: scale(0); } to { transform: scale(1); } }
+@media (prefers-reduced-motion: reduce) { .ghost, .target { transition: none; } .drift, .arrow.press, .ring.on, .halo, .typing i, .keycap, .target, .badge, .badge.wait i { animation: none; } }
+
+/* text being typed at the target. UI Automation actions reveal it letter by letter (monospace so the reveal matches the letters);
+   with the real keyboard each letter is added at the moment it is really typed */
+.typed { position: absolute; left: 26px; top: -22px; display: inline-block; max-width: 340px; overflow: hidden; white-space: nowrap; background: #fff; color: #231f26; font: 600 14px/1 "Cascadia Mono", Consolas, monospace; padding: 7px 10px; border-radius: 8px; box-shadow: 0 2px 0 #cfc7cc, 0 4px 12px rgba(0, 0, 0, .25); width: 0; animation: typeIn 1s steps(var(--n)) forwards; }
+.typed.live { width: auto; animation: none; }
+.typed.live b { display: inline-block; width: 2px; height: 1em; margin-left: 2px; vertical-align: -2px; background: #e8588c; animation: caret .8s steps(1) infinite; }
+@keyframes typeIn { from { width: 0; } to { width: calc(var(--n) * 1ch + 22px); } }
+@keyframes caret { 50% { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .typed { animation: none; width: auto; } .typed.live b { animation: none; } }

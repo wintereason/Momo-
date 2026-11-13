@@ -10,7 +10,7 @@ export function PrivacyPage(_props: PageProps) {
       <fieldset>
         <legend>What Momo keeps</legend>
         <ul className="plain">
-          <li>Your <strong>audio</strong> is never saved. It is turned into text on this PC and discarded.</li>
+          <li>Your <strong>audio</strong> is never saved. By default it is turned into text on this PC and discarded. Only if you choose <em>Cloud speech</em> (Language &amp; voice) is each sentence's audio sent to Groq over HTTPS to be transcribed; Momo still keeps nothing.</li>
           <li>What you dictated is <strong>not stored</strong>. There is no history.</li>
           <li>Only your settings are saved on this PC, plus a small counter of today's AI requests.</li>
           <li>Momo does not type into password boxes it can recognise (ordinary Windows apps). A password box <strong>inside a web page</strong> is not always visible to Windows, so don't dictate passwords or other secrets.</li>

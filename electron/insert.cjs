@@ -41,7 +41,8 @@ function createInserter(deps) {
 
   return {
     /**
-     * @returns {Promise<{ok: true} | {ok: false, reason: "empty" | "keys_held", copied: boolean}>}
+     * opts.beforePaste(): async, {ok:false} cancels the paste. opts.afterPaste(): async, returns a verification string.
+     * @returns {Promise<{ok: true, verification?: string} | {ok: false, reason: "empty" | "keys_held" | "target_lost", copied: boolean, detail?: string}>}
      * `copied` says whether the text is on the clipboard, so the user can still paste it themselves.
      */
     async insert(text, opts = {}) {
@@ -51,11 +52,21 @@ function createInserter(deps) {
       deps.clipboard.writeText(text);
       // The hold shortcut's modifiers (Ctrl/Alt) may still be down: Ctrl+Alt+V would not paste. Wait for them.
       if (!(await modifiersReleased(opts.waitMs ?? 1500))) return { ok: false, reason: "keys_held", copied: true };
+      // Focus the identified field only now, right before the paste, and refuse to paste if that did not work: the paste
+      // key is never sent into a field that was not identified and focused.
+      if (opts.beforePaste) {
+        let g;
+        try { g = await opts.beforePaste(); } catch { g = { ok: false }; }
+        if (!g || g.ok === false) return { ok: false, reason: "target_lost", copied: true, detail: g && g.reason };
+      }
       deps.keys.paste();
-      if (opts.restoreClipboard && typeof previous === "string") {
+      let verification;
+      if (opts.afterPaste) { try { verification = await opts.afterPaste(); } catch { verification = "unreadable"; } }
+      // Give the old clipboard back only once the paste is confirmed to have arrived (it could still be needed otherwise).
+      if (opts.restoreClipboard && typeof previous === "string" && verification !== "failed") {
         setTimer(() => { try { if (deps.clipboard.readText() === text) deps.clipboard.writeText(previous); } catch { /* ignore */ } }, 700);
       }
-      return { ok: true };
+      return { ok: true, verification };
     },
   };
 }

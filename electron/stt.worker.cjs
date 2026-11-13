@@ -4,15 +4,28 @@
 // and it is restricted to the model hub by the same allowlist the pages use (netpolicy.cjs).
 const { parentPort, workerData } = require("node:worker_threads");
 const { makeAllowedRequest } = require("./netpolicy.cjs");
+require("node:dns").setDefaultResultOrder("ipv4first"); // some networks reset IPv6 connections to the model host (worker threads keep their own setting)
 
-const MODEL_ID = "Xenova/whisper-base";
+const MODEL_ID = workerData.model || "Xenova/whisper-small";
 const allowed = makeAllowedRequest(null);
 const realFetch = globalThis.fetch;
 globalThis.fetch = (input, init) => {
   const url = typeof input === "string" ? input : input && input.url ? input.url : String(input);
   if (!allowed(url)) return Promise.reject(new TypeError("blocked destination"));
-  return realFetch(input, init);
+  return fetchWithRetry(input, init);
 };
+// A dropped connection ("fetch failed", ECONNRESET) is common on home networks: try again a few times before giving up.
+async function fetchWithRetry(input, init) {
+  let last;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try { return await realFetch(input, init); } catch (err) {
+      last = err;
+      if (init && init.signal && init.signal.aborted) throw err;
+      await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
+    }
+  }
+  throw last;
+}
 
 let asr = null;
 const post = (m) => parentPort.postMessage(m);
@@ -37,7 +50,7 @@ parentPort.on("message", async (m) => {
   } else if (m.type === "transcribe") {
     try {
       if (!asr) throw new Error("model not loaded");
-      const out = await asr(m.audio, { task: "transcribe", language: m.language, chunk_length_s: 30 });
+      const out = await asr(m.audio, m.language === "auto" ? { task: "transcribe", chunk_length_s: 30 } : { task: "transcribe", language: m.language, chunk_length_s: 30 });
       post({ type: "result", id: m.id, text: String((out && out.text) || "").trim() });
     } catch (err) {
       post({ type: "result-error", id: m.id, message: String((err && err.message) || err) });

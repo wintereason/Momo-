@@ -13,16 +13,14 @@
     "predev": "node scripts/copy-ort.mjs",
     "prebuild": "node scripts/copy-ort.mjs",
     "build:runtime": "node scripts/build-runtime.mjs",
-    "smoke": "node scripts/build-runtime.mjs && node scripts/check-agent-live.cjs"
+    "smoke": "node scripts/build-runtime.mjs && node scripts/check-agent-live.cjs",
+    "dist": "node scripts/copy-ort.mjs && node scripts/build-runtime.mjs && vite build && electron-builder --win",
+    "dist:dir": "node scripts/copy-ort.mjs && node scripts/build-runtime.mjs && vite build && electron-builder --win dir"
   },
   "dependencies": {
     "@huggingface/transformers": "^3.2.4",
     "koffi": "^2.9.2",
-    "react": "18.3.1",
-    "react-dom": "18.3.1",
-    "three": "^0.169.0",
-    "uiohook-napi": "^1.5.4",
-    "zod": "3.23.8"
+    "uiohook-napi": "^1.5.4"
   },
   "devDependencies": {
     "@gltf-transform/core": "^4.0.10",
@@ -31,10 +29,56 @@
     "@types/three": "^0.169.0",
     "@vitejs/plugin-react": "4.3.4",
     "electron": "^33.2.1",
+    "electron-builder": "^24.13.3",
     "sharp": "^0.33.5",
     "typescript": "5.6.3",
     "vite": "5.4.11",
-    "vitest": "2.1.8"
+    "vitest": "2.1.8",
+    "react": "18.3.1",
+    "react-dom": "18.3.1",
+    "three": "^0.169.0",
+    "zod": "3.23.8"
   },
-  "main": "electron/main.cjs"
+  "main": "electron/main.cjs",
+  "description": "Momo: private voice dictation for Windows",
+  "author": "Momo",
+  "build": {
+    "appId": "app.momo.dictation",
+    "productName": "Momo",
+    "directories": {
+      "output": "release"
+    },
+    "asar": false,
+    "files": [
+      "electron/**/*",
+      "!electron/**/*.test.mjs",
+      "dist/**/*",
+      "assets/icon.png",
+      "package.json",
+      "!node_modules/onnxruntime-node/bin/napi-v3/{darwin,linux}/**",
+      "!node_modules/onnxruntime-node/bin/napi-v3/win32/arm64/**",
+      "!node_modules/onnxruntime-web/**",
+      "!node_modules/**/*.map",
+      "!node_modules/**/{test,tests,docs}/**"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.png"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Momo",
+      "runAfterFinish": true
+    }
+  }
 }

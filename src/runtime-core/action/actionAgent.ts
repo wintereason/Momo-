@@ -1,11 +1,12 @@
-import type { ActResult, ActionPort, FsPort, InputPort, SetTextResult, WindowState } from "../shared/ports";
+import type { ActResult, ActionPort, FsPort, InputPort, SetTextResult, SubmitResult, WindowState } from "../shared/ports";
 
 export type ActionResult = ActResult;
 
 export const MAX_TYPED_CHARS = 500;
 
 export interface WindowTarget { hwnd: number; pid: number }
-export interface ControlTarget extends WindowTarget { rid: string; name: string }
+/** `unnamedOk`: the control has no label at all (an icon); it is then identified by its runtime id alone, and only a caller that already asked the user may say so. */
+export interface ControlTarget extends WindowTarget { rid: string; name: string; unnamedOk?: boolean }
 
 /**
  * Executes approved operations on an identified target. It is deliberately narrow, and it re-checks
@@ -99,9 +100,29 @@ export class ActionAgent {
   async clickControl(t: ControlTarget): Promise<ActResult> {
     const c = await this.checkWindow(t);
     if (!c.ok) return c;
-    if (!t.rid || !t.name) return { ok: false, reason: "I can't identify that control exactly, so I won't click it." };
+    if (!t.rid || (!t.name && !t.unnamedOk)) return { ok: false, reason: "I can't identify that control exactly, so I won't click it." };
     this.calls++;
     return this.input!.invokeControl(t.hwnd, t.rid, t.name);
+  }
+
+  /** Put the cursor in one identified field (so the next dictation goes there). */
+  async focusField(t: ControlTarget): Promise<ActResult> {
+    const c = await this.checkWindow(t);
+    if (!c.ok) return c;
+    if (!t.rid || !t.name) return { ok: false, reason: "I can't identify that field exactly, so I won't select it." };
+    if (!this.input!.focusControl) return { ok: false, reason: "Selecting a field isn't available in this build." };
+    this.calls++;
+    return this.input!.focusControl(t.hwnd, t.rid, t.name);
+  }
+
+  /** Press Enter in the identified field, only if it still has the cursor. */
+  async submitField(t: ControlTarget): Promise<SubmitResult> {
+    const c = await this.checkWindow(t);
+    if (!c.ok) return c;
+    if (!t.rid || !t.name) return { ok: false, reason: "I can't identify that field exactly, so I won't press Enter in it." };
+    if (!this.input!.submitControl) return { ok: false, reason: "Pressing Enter isn't available in this build." };
+    this.calls++;
+    return this.input!.submitControl(t.hwnd, t.rid, t.name);
   }
 
   async typeText(t: ControlTarget, text: string): Promise<SetTextResult> {
