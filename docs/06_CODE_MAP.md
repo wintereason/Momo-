@@ -15,6 +15,7 @@ the temporary world model.
 | `browser/` | Tabs and pages | `momo-browser` |
 | `action/` | Clicks, typing, safety policy | `momo-action` |
 | `verifier/` | Verification + temporary world model | `momo-verifier` |
+| `languageTeacher/` | Plays the other role of a language interview (one validated line per call); holds the learner-progress summary the orchestrator reads | `momo-language-teacher` |
 | `shared/` | ports, redaction, node ports, screen-text helpers | (orchestrator approves changes) |
 
 Flow: the orchestrator reads the request, asks specialists to observe (writing to the world model), has the

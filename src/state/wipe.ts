@@ -1,4 +1,5 @@
 import { PREFS_KEY, type KV } from "./settings";
+import { LEARNING_KEY } from "../learning/store";
 
 export const SPEECH_MODEL_CACHE = "transformers-cache";
 
@@ -27,6 +28,7 @@ export async function wipeAllData(d: WipeDeps): Promise<WipeResult> {
   const failed: string[] = [];
 
   try { d.kv.removeItem(PREFS_KEY); removed.push("your settings"); } catch { failed.push("your settings"); }
+  try { d.kv.removeItem(LEARNING_KEY); removed.push("your language-learning progress"); } catch { failed.push("your language-learning progress"); }
 
   if (d.caches) {
     try {

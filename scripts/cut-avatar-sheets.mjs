@@ -12,7 +12,6 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const SHEETS = [
-  { id: "pink", file: "assets/reference/avatar_sheet_pink.png" },
   { id: "dark", file: "assets/reference/avatar_sheet_dark.png" },
 ];
 const COLS = 3, ROWS = 2;

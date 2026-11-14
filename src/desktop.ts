@@ -13,7 +13,7 @@ export interface EnvStatus {
     limitPerDay: number;
     keys: { gemini: boolean; groq: boolean; openrouter: boolean; ollama: boolean };
   };
-  speech: { hfToken: boolean };
+  speech: { hfToken: boolean; /** is an online-voice key saved? (only yes/no is ever shown) */ onlineVoiceKey: boolean };
   problems: string[];
 }
 
@@ -44,6 +44,11 @@ export interface DictateAnswer {
   cancelled?: boolean;
 }
 
+/** The Language Teacher's answer: one line of the roleplay, or an honest reason it could not answer. */
+export type LanguageConverseAnswer =
+  | { ok: true; reply: { reply: string; translation?: string; romanization?: string; objective?: string; kind?: "question" | "follow-up" | "reaction" | "closing"; end?: boolean }; source: string; cloud: boolean }
+  | { ok: false; message: string; retryable: boolean };
+
 /** What the shadow-cursor window is told (positions are in the overlay's own pixels). */
 export type CursorMessage =
   | { kind: "show"; x: number; y: number }
@@ -69,6 +74,12 @@ export interface MomoDesktop {
   barInteractive(on: boolean): void;
   /** resize the bar window for the compact face or the expanded character (it stays transparent and click-through) */
   setBarLayout(view: "compact" | "expanded"): void;
+  /** where the bar's buttons and cards are, so only those take the mouse */
+  setBarHitRects(rects: { x: number; y: number; w: number; h: number }[]): void;
+  /** the Language Teacher plays the other role of a roleplay interview: one validated line per call */
+  languageConverse(req: unknown): Promise<LanguageConverseAnswer>;
+  /** the learner's progress as short text (memory only), so the orchestrator can answer progress questions */
+  setLanguageSummary(text: string): void;
   openSettings(): void;
   quit(): void;
   /** the user started speaking: check in the background whether the focused field is a password box */
@@ -90,6 +101,8 @@ export interface MomoDesktop {
   sttStatus(): Promise<{ cached: boolean; state: "idle" | "loading" | "ready" | "error"; lastError: string } | null>;
   sttLoad(onProgress?: (p: { percent: number; loadedMB: number; totalMB: number }) => void): Promise<{ ok: boolean; error?: string }>;
   sttTranscribe(audio: Float32Array, language: string, engine?: "local" | "cloud"): Promise<{ ok: boolean; text?: string; reason?: string; engine?: "local" | "cloud"; note?: string }>;
+  /** online voice (optional): text and a voice id -> mp3 audio, or the reason it could not be used */
+  ttsOnline(text: string, voiceId: string): Promise<{ ok: true; audio: Uint8Array } | { ok: false; reason: string }>;
   /** the shadow cursor window: what to draw (it only exists while a task runs) */
   onCursor(cb: (m: CursorMessage) => void): () => void;
   /** show the shadow cursor while Momo works on a task? */

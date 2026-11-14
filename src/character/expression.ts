@@ -8,11 +8,12 @@ import { PERSONAS } from "./personality";
  * voice pipeline and the agent's events) and whether it is speaking right now. The character never decides anything about
  * the task: this is a one-way read of the state.
  */
-export function expressionFor(bar: BarState, speaking: boolean, personality: Personality): ExpressionId {
+export function expressionFor(bar: BarState, speaking: boolean, personality: Personality, asleep = false): ExpressionId {
   const persona = PERSONAS[personality];
   switch (bar.phase) {
     case "idle":
-      return speaking ? "speaking" : persona.idle;
+      if (speaking) return "speaking";
+      return asleep ? "sleepy" : persona.idle; // asleep = nothing has happened for a few minutes
     case "listening":
       return "listening";
     case "transcribing":
@@ -22,7 +23,7 @@ export function expressionFor(bar: BarState, speaking: boolean, personality: Per
       // "Working it out…" = planning; any other message is a step being carried out
       return bar.message === "Working it out…" ? "thinking" : "serious";
     case "confirming":
-      return "warning"; // a consequential action: careful, and waiting for the user
+      return "worried"; // a consequential action: careful, and waiting for the user
     case "asking":
       return "confused";
     case "done": {

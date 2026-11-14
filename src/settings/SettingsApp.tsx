@@ -10,6 +10,7 @@ import { AskPage } from "./pages/AskPage";
 import { PrivacyPage } from "./pages/PrivacyPage";
 import { GeneralPage } from "./pages/GeneralPage";
 import { CharacterPage } from "./pages/CharacterPage";
+import { LearnPage } from "./pages/LearnPage";
 import "../styles/settings.css";
 
 export interface PageProps {
@@ -24,6 +25,7 @@ const PAGES = [
   { id: "shortcut", label: "Shortcut", icon: "⌨", group: "Dictation" },
   { id: "ai", label: "AI & keys", icon: "✦", group: "Smart features" },
   { id: "ask", label: "Ask Momo", icon: "💬", group: "Smart features" },
+  { id: "learn", label: "Learn a language", icon: "🎓", group: "Smart features" },
   { id: "character", label: "Character", icon: "☺", group: "App" },
   { id: "general", label: "General", icon: "⚙", group: "App" },
   { id: "privacy", label: "Privacy & data", icon: "🔒", group: "App" },
@@ -67,6 +69,7 @@ export default function SettingsApp() {
           </p>
         )}
         {page === "home" && <HomePage prefs={prefs} set={set} go={(p) => setPage(p)} />}
+        {page === "learn" && <LearnPage prefs={prefs} set={set} />}
         {page === "character" && <CharacterPage prefs={prefs} set={set} />}
         {page === "general" && <GeneralPage prefs={prefs} set={set} />}
         {page === "dictation" && <DictationPage prefs={prefs} set={set} />}

@@ -24,6 +24,11 @@ export interface AiService {
   polish(text: string, style: "light" | "polish"): Promise<AiOutcome<{ text: string; source: string }>>;
   usage(): { count: number; limit: number };
   /**
+   * One turn of a role-played conversation (the Language Teacher). Only the conversation text is sent: the scene, the level and the
+   * lines so far. No planner, no tools, no screen content.
+   */
+  converse?(input: { system: string; messages: { role: "user" | "assistant"; text: string }[]; maxTokens: number }): Promise<{ ok: true; text: string; source: string } | { ok: false; message: string; reason: string }>;
+  /**
    * Can a PICTURE be looked at? Only if a provider with a vision model is set up, and (for a cloud one) the user switched on screen context.
    * Even then, every picture is sent only after the user agrees to that one picture. Absent in simple fakes.
    */
@@ -60,6 +65,12 @@ export function createAiService(llm: LlmClient, config: () => AiConfig): AiServi
     isCloud: () => { const p = first(); return p ? isCloud(p) : false; },
     canSeeScreen: () => { const p = first(); return !!p && (!isCloud(p) || config().allowScreenContext); },
     usage: () => llm.usageToday(),
+
+    async converse(input) {
+      const r = await llm.complete({ system: input.system, tier: "smart", json: true, maxTokens: input.maxTokens, timeoutMs: 30_000, messages: input.messages });
+      if (!r.ok) return { ok: false, reason: r.reason, message: FAILURE_MESSAGES[r.reason] };
+      return { ok: true, text: r.text, source: NAMES[r.provider] };
+    },
 
     canSeeImages: () => {
       const c = config();

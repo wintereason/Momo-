@@ -2,7 +2,8 @@
 //  - Secret values never leave this process: the UI is only ever given booleans and plain-English problems.
 //  - Only the keys listed in KEYS are read; anything else in the file is ignored.
 //  - Nothing here logs a value, and error messages never contain one.
-//  - Only FREE services are supported (Gemini free tier, Groq free tier, OpenRouter ":free" models, local Ollama).
+//  - Only FREE services are supported (Gemini free tier, Groq free tier, OpenRouter ":free" models, local Ollama), plus ONE optional
+//    online voice (ElevenLabs, used only when its key is set; its free tier is enough for short replies).
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -26,6 +27,9 @@ const KEYS = {
   MOMO_AI_MAX_REQUESTS_PER_DAY: { group: "ai", kind: "setting", check: /^\d{1,5}$/, hint: "must be a whole number" },
   MOMO_AI_ALLOW_SCREEN_CONTEXT: { group: "ai", kind: "setting", check: /^(true|false)$/i, hint: "must be true or false" },
 
+  // optional online voices for the avatars: spoken replies are sent to ElevenLabs only while this key is set
+  ELEVENLABS_API_KEY: { group: "speech", kind: "secret", check: /^[A-Za-z0-9_-]{16,128}$/, hint: "looks wrong (letters, digits, - and _ only)" },
+  MOMO_VOICE_MAX_CHARS_PER_DAY: { group: "speech", kind: "setting", check: /^\d{3,6}$/, hint: "must be a whole number" },
   HF_TOKEN: { group: "speech", kind: "secret", check: /^hf_[A-Za-z0-9]{20,}$/, hint: "should start with hf_" },
 };
 
@@ -103,13 +107,13 @@ function status(values, files = []) {
       screenContext: /^true$/i.test(values.MOMO_AI_ALLOW_SCREEN_CONTEXT || ""),
       keys: { gemini: has("GEMINI_API_KEY"), groq: has("GROQ_API_KEY"), openrouter: has("OPENROUTER_API_KEY"), ollama: has("OLLAMA_HOST") },
     },
-    speech: { hfToken: has("HF_TOKEN") },
+    speech: { hfToken: has("HF_TOKEN"), onlineVoiceKey: has("ELEVENLABS_API_KEY") },
     problems: probs,
   };
 }
 
 // What the Settings page may change. Everything else in the file is left exactly as it is.
-const EDITABLE = ["MOMO_AI_ENABLED", "MOMO_AI_PROVIDER", "GEMINI_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY", "OLLAMA_HOST", "HF_TOKEN"];
+const EDITABLE = ["MOMO_AI_ENABLED", "MOMO_AI_PROVIDER", "GEMINI_API_KEY", "GROQ_API_KEY", "OPENROUTER_API_KEY", "OLLAMA_HOST", "HF_TOKEN", "ELEVENLABS_API_KEY"];
 
 /**
  * Write-only update of the .env file from the Settings page. updates: { KEY: "value" } where "" removes the setting.

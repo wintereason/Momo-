@@ -39,23 +39,30 @@ function hits(re: RegExp): { file: string; line: string }[] {
 const files = (h: { file: string }[]) => [...new Set(h.map((x) => x.file))].sort();
 
 describe("what Momo writes to disk", () => {
-  it("writes only preferences, the AI request counter, and the speech-model cache", () => {
+  it("writes only preferences, the AI request counter, the online-voice character counter, and the speech-model cache", () => {
     const writes = hits(/\b(writeFile|writeFileSync|appendFile|appendFileSync|createWriteStream|localStorage\.setItem|\.setItem\(|sessionStorage|indexedDB|document\.cookie|openDatabase)\b/);
-    expect(files(writes)).toEqual(["electron/env.cjs", "electron/main.cjs", "src/state/settings.ts"]);
+    expect(files(writes)).toEqual(["electron/env.cjs", "electron/main.cjs", "src/learning/store.ts", "src/state/settings.ts"]);
     // electron/env.cjs: exactly one write, inside save(): the keys the user typed into Settings, into Momo's own .env
     const envWrites = writes.filter((w) => w.file === "electron/env.cjs");
     expect(envWrites).toHaveLength(1);
     expect(envWrites[0].line).toContain("fs.writeFileSync(file, out.join(");
-    // electron/main.cjs: exactly two writes: the AI's daily request counter (a date and a number), and the one-byte marker
+    // electron/main.cjs: exactly three writes: the AI's daily request counter (a date and a number), the online-voice daily character
+    // counter (a date and a number, only used while the optional online-voice key is set), and the one-byte marker
     // that says "start-with-Windows was already offered" (so it is only switched on once, on first run)
     const mainWrites = writes.filter((w) => w.file === "electron/main.cjs");
-    expect(mainWrites).toHaveLength(2);
+    expect(mainWrites).toHaveLength(3);
+    const voiceUsage = mainWrites.find((w) => w.line.includes("voiceUsageFile()"))!;
+    expect(voiceUsage.line).toContain("JSON.stringify({ date: localDate(), chars: used + n })");
     const usage = mainWrites.find((w) => w.line.includes("usageFile()"))!;
     expect(usage.line).toContain("JSON.stringify({ date: String(u.date), count: Number(u.count) })");
     const marker = mainWrites.find((w) => w.line.includes("mark"))!;
     expect(marker.line).toContain('fs.writeFileSync(mark, "1")');
     // settings.ts: preferences only
     expect(writes.filter((w) => w.file === "src/state/settings.ts").every((w) => /PREFS_KEY/.test(w.line))).toBe(true);
+    // src/learning/store.ts: the language-learning progress (per learner profile, this PC only, removed by "Delete my data"): one write, under its own key
+    const learn = writes.filter((w) => w.file === "src/learning/store.ts");
+    expect(learn).toHaveLength(1);
+    expect(learn[0].line).toContain("LEARNING_KEY");
   });
 
   it("the clipboard is written only with text the user dictated (never read from the screen)", () => {
@@ -107,7 +114,17 @@ describe("what touches the network", () => {
     const net = hits(/(^|[^\w"'])fetch\b(?!Fn)|\b(XMLHttpRequest|WebSocket\(|EventSource\(|sendBeacon|https?\.request|https?\.get\(|net\.connect|dgram|axios)\b/).filter((n) => !/typeof fetch/.test(n.line));
     // The only other network client is the speech-model loader inside @huggingface/transformers (a dependency).
     // Exactly two places use fetch: one reads the app's OWN bundled files, and the AI client talks to pinned hosts only.
-    expect([...new Set(net.map((n) => n.file))].sort()).toEqual(["electron/appProtocol.cjs", "electron/cloudStt.cjs", "electron/stt.worker.cjs", "src/runtime-core/orchestrator/ai/llm.ts"]);
+    expect([...new Set(net.map((n) => n.file))].sort()).toEqual(["electron/appProtocol.cjs", "electron/cloudStt.cjs", "electron/onlineVoice.cjs", "electron/stt.worker.cjs", "src/runtime-core/orchestrator/ai/llm.ts"]);
+    // Online avatar voices (optional, used only while an ElevenLabs key is saved): ONE pinned HTTPS destination, the key only in a header,
+    // only text and a voice id in the body, and the shell's handler is the single caller
+    const online = read("electron/onlineVoice.cjs");
+    expect(online).toMatch(/const URL_BASE = "https:\/\/api\.elevenlabs\.io\/v1\/text-to-speech\/";/);
+    expect(online.match(/fetchFn\(/g)).toHaveLength(1);
+    expect(online).toMatch(/fetchFn\(URL_BASE \+ voiceId/);
+    expect(online).toMatch(/headers: \{ "xi-api-key": key,/);
+    expect(online).toMatch(/body: JSON\.stringify\(\{ text, model_id: /);
+    expect(online).not.toMatch(/node:fs|require\("fs"\)|writeFile|console\./); // it writes nothing and logs nothing
+    expect(strip(read("electron/main.cjs")).match(/synthOnline\(/g)).toHaveLength(1);
     // Cloud speech (optional, off unless the user picks it): ONE pinned HTTPS destination, the key only in the header,
     // and the shell calls it only when the page asked for the cloud engine
     const cloud = read("electron/cloudStt.cjs");
@@ -261,7 +278,7 @@ describe("API keys from .env stay inside the desktop shell", () => {
     const sends = [...main.matchAll(/webContents\.send\([^)]*\)/g)].map((m) => m[0]).join("\n");
     expect(sends).not.toMatch(/envValues|process\.env/);
     // every mention of the raw values is one of these uses: nothing else touches them
-    const allowed = [/^let envValues = \{\};$/, /^const text = await transcribeCloud\(\{ key: envValues\.GROQ_API_KEY, audio: p\.audio\.slice\(\), language: p\.language \}\);$/, /^envValues = r\.values;$/, /envConfig\.status\(envValues, envFiles\)/, /buildAiConfig\(envValues\)/];
+    const allowed = [/^let envValues = \{\};$/, /^const text = await transcribeCloud\(\{ key: envValues\.GROQ_API_KEY, audio: p\.audio\.slice\(\), language: p\.language \}\);$/, /^return synthOnline\(\{ key: envValues\.ELEVENLABS_API_KEY, text: p\.text, voiceId: p\.voiceId, budget: voiceBudget\(envValues\.MOMO_VOICE_MAX_CHARS_PER_DAY\) \}\);$/, /^envValues = r\.values;$/, /envConfig\.status\(envValues, envFiles\)/, /buildAiConfig\(envValues\)/];
     for (const line of main.split("\n").map((l) => l.trim()).filter((l) => l.includes("envValues"))) {
       expect(allowed.some((a) => a.test(line)), "unexpected use of envValues: " + line).toBe(true);
     }

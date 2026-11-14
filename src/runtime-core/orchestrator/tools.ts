@@ -31,6 +31,8 @@ export interface AgentDeps {
   appAgent: AppAgent;
   /** the planner (a free AI service). Absent = Momo cannot plan, and says so */
   ai?: AiService;
+  /** the learner's language-learning status as short text (kept by the Language Teacher role); absent or null = nothing to report */
+  languageSummary?: () => string | null;
   /** which window the user was in before turning to Momo (absent in tests / non-Windows) */
   foreground?: ForegroundPort;
   verifier: Verifier;
@@ -472,6 +474,19 @@ export function buildTools(): ToolDef[] {
     const r = t.risk;
     tools.push({ ...t, risk: (a: Record<string, unknown>) => (typeof r === "function" ? r(a as z.infer<S>) : r ?? "read") } as unknown as ToolDef);
   };
+
+  // ---------------------------------------------------------------- Language Teacher
+  add({
+    name: "language_progress", signature: "language_progress({})",
+    description: "The user's language-learning status from Momo's Language Teacher: the language, level, lessons passed, and what to study next. Read-only. Use it when the user asks about their learning progress or what to practise.",
+    sensitive: false, risk: "read", schema: z.object({}).strict(),
+    describe: () => "Check language learning progress.", working: () => "Checking your learning progress…",
+    async run(_a, ctx) {
+      const s = ctx.d.languageSummary?.();
+      if (!s) return ok("No language course has been started yet. Open Momo settings → Learn to begin.", true);
+      return ok(s, true);
+    },
+  });
 
   // ---------------------------------------------------------------- File System Agent
   add({

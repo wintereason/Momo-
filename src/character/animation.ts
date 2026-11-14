@@ -15,3 +15,17 @@ export function motionAmount(level: "full" | "reduced" | "off", osReduced: boole
   if (level === "reduced" || osReduced) return { sway: 0, blink: true, ease: true };
   return { sway: 1, blink: true, ease: true };
 }
+
+/**
+ * How shut the eyelids are, 0 (open) .. 1 (closed), `elapsedMs` after a blink began. Timed like the reference animation:
+ * about 100 ms closing, a short hold, about 100 ms opening (300 ms in all), eased so it never snaps.
+ */
+export const BLINK_MS = 300;
+export function lidClosure(elapsedMs: number, total = BLINK_MS): number {
+  if (elapsedMs <= 0 || elapsedMs >= total) return 0;
+  const third = total / 3;
+  const sm = (x: number) => x * x * (3 - 2 * x);
+  if (elapsedMs < third) return sm(elapsedMs / third);
+  if (elapsedMs < 2 * third) return 1;
+  return sm(1 - (elapsedMs - 2 * third) / third);
+}

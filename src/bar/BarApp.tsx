@@ -7,7 +7,11 @@ import { isSpriteArt } from "../character/avatars";
 import { MouthSync } from "../character/speechMouth";
 import { expressionFor } from "../character/expression";
 import { leadIn, styleMessage } from "../character/personality";
-import { barReducer, holdMs, initialBar, needsClicks, type BarEvent, type BarMode, type DictateResult } from "../state/dictationState";
+import { SpeechCloud, useSpokenCloud } from "../character/SpeechCloud";
+import { VOICE_HINTS, onlineVoiceIdFor } from "../character/config";
+import { attachOnlineVoice } from "../voice/onlineVoice";
+import { faceWhileSpeaking } from "../character/textExpression";
+import { barReducer, holdMs, initialBar, type BarEvent, type BarMode, type DictateResult } from "../state/dictationState";
 import { activationStep, type ActivationInput } from "../state/activation";
 import { parseRuntimeEvent } from "../types/runtime-events";
 import { LiveVoice } from "../voice/liveVoice";
@@ -41,7 +45,8 @@ export default function BarApp() {
   barRef.current = bar;
   const modeRef = useRef<BarMode>("dictate");
   const speakerRef = useRef<Speaker | null>(null);
-  if (!speakerRef.current) { speakerRef.current = new Speaker(); speakerRef.current.listen(mouth.handle); }
+  const spoken = useSpokenCloud();
+  if (!speakerRef.current) { speakerRef.current = new Speaker(); attachOnlineVoice(speakerRef.current); speakerRef.current.listen((e) => { mouth.handle(e); spoken.handle(e); }); }
   const speaking = useSyncExternalStore(mouth.subscribe.bind(mouth), () => mouth.speaking);
   const goalSeq = useRef(0);
   spokenLanguage = prefs.speechLanguage;
@@ -82,7 +87,9 @@ export default function BarApp() {
         if (e.type === "task.completed") say.text = leadIn("completed", pers) + say.text;
         else if (e.type === "task.failed") say.text = leadIn("failed", pers) + say.text;
         const s = forSpeech(say);
-        speakerRef.current?.speak(s.text, { voiceURI: p.voiceURI, rate: p.rate, lang: prefsRef.current.speechLanguage }, !s.queue);
+        // each avatar has its own voice (falling back to the general one when it has none chosen)
+        const vp = prefsRef.current.character.voices[prefsRef.current.character.art];
+        speakerRef.current?.speak(s.text, { voiceURI: vp.voiceURI ?? p.voiceURI, rate: vp.rate * p.rate, pitch: vp.pitch, lang: prefsRef.current.speechLanguage, ...VOICE_HINTS[prefsRef.current.character.art], onlineVoiceId: onlineVoiceIdFor(prefsRef.current.character) }, !s.queue);
       }
     });
   }, []);
@@ -202,21 +209,19 @@ export default function BarApp() {
     return () => clearTimeout(h);
   }, [bar]);
 
-  // The bar is click-through. Only while the pointer is over a button or card (marked data-hit) does it take the mouse, so the
-  // character and the empty space around it never get in the way of the windows underneath.
-  const overRef = useRef(false);
+  // The bar is click-through. It tells the desktop shell where its buttons and cards are (marked data-hit); the shell watches
+  // the real pointer and lets the mouse through everywhere else, so the character and the empty space never block other windows.
+  const lastRects = useRef("");
   useEffect(() => {
-    const move = (e: MouseEvent) => {
-      const over = !!(e.target as Element | null)?.closest?.("[data-hit]");
-      if (over !== overRef.current) { overRef.current = over; desktop?.barInteractive(over); }
+    const send = () => {
+      const rects = [...document.querySelectorAll("[data-hit]")].slice(0, 12).map((el) => { const r = el.getBoundingClientRect(); return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) }; }).filter((r) => r.w > 0 && r.h > 0);
+      const key = JSON.stringify(rects);
+      if (key !== lastRects.current) { lastRects.current = key; desktop?.setBarHitRects(rects); }
     };
-    const leave = () => { if (overRef.current) { overRef.current = false; desktop?.barInteractive(false); } };
-    window.addEventListener("mousemove", move);
-    document.addEventListener("mouseleave", leave);
-    return () => { window.removeEventListener("mousemove", move); document.removeEventListener("mouseleave", leave); desktop?.barInteractive(false); };
+    send();
+    const h = window.setInterval(send, 150);
+    return () => { window.clearInterval(h); desktop?.setBarHitRects([]); };
   }, []);
-  // a card that disappears under the pointer must not leave the bar catching clicks
-  useEffect(() => { if (!needsClicks(bar) && overRef.current && !document.querySelector("[data-hit]:hover")) { overRef.current = false; desktop?.barInteractive(false); } }, [bar]);
 
   // the window follows the character's size
   const ch = prefs.character;
@@ -228,7 +233,16 @@ export default function BarApp() {
     setPrefs(next);
   };
   const shown = { ...bar, message: styleMessage(bar.message, ch.personality) };
-  const expression = expressionFor(bar, speaking, ch.personality);
+  // after a few quiet minutes Momo gets sleepy; anything happening wakes it
+  const [asleep, setAsleep] = useState(false);
+  useEffect(() => {
+    setAsleep(false);
+    if (bar.phase !== "idle" || speaking) return;
+    const h = window.setTimeout(() => setAsleep(true), 3 * 60_000);
+    return () => window.clearTimeout(h);
+  }, [bar, speaking]);
+  // what Momo is doing decides problems and decisions; while it speaks, the sentence being said decides the rest
+  const expression = faceWhileSpeaking(expressionFor(bar, speaking, ch.personality, asleep), speaking ? spoken.words : null, ch.personality);
 
   useEffect(() => () => liveRef.current?.cancel(), []);
 
@@ -305,8 +319,9 @@ export default function BarApp() {
       {ch.enabled && (
         <div className={`dock ${ch.view}${isSpriteArt(ch.art) ? " has-art" : ""}`}>
           {isSpriteArt(ch.art)
-            ? <AvatarView character={ch} expression={expression} view={ch.view} className="dock-art" />
+            ? <AvatarView character={ch} expression={expression} view={ch.view} mouth={mouth} className="dock-art" />
             : <Momo appearance={ch} expression={expression} mouth={mouth} view={ch.view} className="dock-svg" />}
+          <SpeechCloud cloud={spoken.cloud} />
           <button data-hit className="dock-toggle" onClick={toggleView} aria-label={ch.view === "compact" ? "Expand Momo" : "Shrink Momo"} title={ch.view === "compact" ? "Expand" : "Shrink"}>{ch.view === "compact" ? "⤢" : "⤡"}</button>
         </div>
       )}

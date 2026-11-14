@@ -10,6 +10,7 @@ import { UiPanelAgent } from "../uipanel";
 import { VisualAgent } from "../vision";
 import { DEFAULT_POLICY, type Policy } from "../action";
 import { localClean, type DictationOutcome, type DictationStyle } from "./dictation";
+import { LanguageTeacherAgent } from "../languageTeacher";
 import { Verifier } from "../verifier";
 import { WorldModel } from "../verifier";
 
@@ -56,12 +57,14 @@ export class Session {
   readonly appAgent: AppAgent;
   readonly orchestrator: Orchestrator;
   private ai?: AiService;
+  private teacher: LanguageTeacherAgent;
   private policy: Policy = { ...DEFAULT_POLICY };
   private disposed = false;
 
   constructor(deps: SessionDeps) {
     const now = deps.now ?? Date.now;
     this.ai = deps.ai;
+    this.teacher = new LanguageTeacherAgent(deps.ai && deps.ai.converse ? { ready: () => deps.ai!.ready(), label: () => deps.ai!.label(), isCloud: () => deps.ai!.isCloud(), converse: (i) => deps.ai!.converse!(i) } : undefined);
     this.world = new WorldModel(now);
     this.fsAgent = new FileSystemAgent(this.world, deps.fs, now);
     this.desktopAgent = new DesktopAgent(this.world, deps.win, deps.selfPids);
@@ -76,7 +79,7 @@ export class Session {
     this.visualAgent = new VisualAgent(this.world, screen);
     this.orchestrator = new Orchestrator({
       world: this.world, fsAgent: this.fsAgent, desktopAgent: this.desktopAgent, actionAgent: this.actionAgent,
-      uiAgent: this.uiAgent, visualAgent: this.visualAgent, appAgent: this.appAgent, foreground: deps.foreground, ai: deps.ai,
+      uiAgent: this.uiAgent, visualAgent: this.visualAgent, appAgent: this.appAgent, foreground: deps.foreground, ai: deps.ai, languageSummary: () => this.teacher.getSummary(),
       verifier: new Verifier(), fs: deps.fs, policy: () => this.policy,
       sleep: deps.sleep, confirmTimeoutMs: deps.confirmTimeoutMs, taskTimeoutMs: deps.taskTimeoutMs, verifyAttempts: deps.verifyAttempts, maxSteps: deps.maxSteps, cursorLeadMs: deps.cursorLeadMs, pointer: deps.pointer,
       emit: (e) => { if (!this.disposed) deps.emit(e); },
@@ -107,6 +110,18 @@ export class Session {
     if (r.ok) return { ok: true, text: r.text, polished: true, source: r.source };
     return { ok: true, text: localClean(text), polished: false, note: `${r.message} I only fixed the basics.` };
   }
+
+  /**
+   * The Language Teacher plays the other side of a roleplay interview: one line per call. It never touches the desktop, the learner's
+   * progress or permissions; the reply is validated before it is returned.
+   */
+  async converse(raw: unknown): ReturnType<LanguageTeacherAgent["converse"]> {
+    if (this.disposed) return { ok: false, message: "Momo is closing.", retryable: false };
+    return this.teacher.converse(raw);
+  }
+
+  /** The learner's progress as a short text (kept current by the Settings window), for the orchestrator's read-only tool. */
+  setLanguageSummary(text: string): void { this.teacher.setSummary(text); }
 
   /** The user pressed Confirm or Cancel on a confirmation card. */
   respondConfirmation(taskId: string, approved: boolean): Promise<void> {

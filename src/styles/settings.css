@@ -175,7 +175,7 @@ input::placeholder { color: var(--muted); opacity: .8; }
 .stage[data-theme="cyber"] { background: radial-gradient(circle at 50% 35%, #0f3a4a, #071119 75%); }
 .stage[data-theme="neon"] { background: radial-gradient(circle at 50% 35%, #3b0f5c, #0d0617 75%); }
 .preview-svg { width: 100%; height: 100%; }
-.preview-art { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; object-position: 50% 100%; filter: drop-shadow(0 8px 16px rgba(0, 0, 0, .45)); animation: avatar-in .18s ease-out; }
+.preview-art { position: relative; width: 100%; height: 100%; filter: drop-shadow(0 8px 16px rgba(0, 0, 0, .45)); animation: avatar-in .18s ease-out; }
 @media (prefers-reduced-motion: reduce) { .preview-art { animation: none; } }
 @keyframes avatar-in { from { opacity: .4; transform: translateY(3px); } to { opacity: 1; transform: none; } }
 .bubble { margin: 0 0 12px; padding: 10px 14px; background: var(--accent-soft); border-radius: 14px; font-weight: 600; }

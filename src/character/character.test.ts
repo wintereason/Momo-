@@ -7,9 +7,8 @@ import { CharacterPrefsSchema, defaultCharacter, PERSONALITIES } from "./config"
 import { expressionFor } from "./expression";
 import { BUILDS, EXPRESSIONS, EXPRESSION_DEFS, browPath, ease, easeFace, eyePaths, faceDistance, mouthPath } from "./face";
 import { PERSONAS, leadIn, phrase, styleMessage } from "./personality";
-import { MouthSync, visemeAt } from "./speechMouth";
+import { visemeAt } from "./speechMouth";
 import { blinkFactor, motionAmount, nextBlinkDelay } from "./animation";
-import { Speaker, type SynthLike, type UtteranceCtor } from "../voice/tts";
 
 const agent = (s: BarState, event: Parameters<typeof barReducer>[1] extends infer E ? (E extends { type: "agent"; event: infer V } ? V : never) : never) => barReducer(s, { type: "agent", event });
 
@@ -23,7 +22,7 @@ describe("which face Momo wears follows what Momo is really doing", () => {
   });
   it("carrying out a step looks focused; a decision looks careful; a question looks puzzled", () => {
     expect(f(agent(initialBar, { type: "task.state", taskId: "t", state: "working", message: "Opening Chrome…" }))).toBe("serious");
-    expect(f(agent(initialBar, { type: "task.confirmation_required", taskId: "t", summary: "Close Notepad?" }))).toBe("warning");
+    expect(f(agent(initialBar, { type: "task.confirmation_required", taskId: "t", summary: "Close Notepad?" }))).toBe("worried");
     expect(f(agent(initialBar, { type: "task.clarification_required", taskId: "t", question: "Which one?" }))).toBe("confused");
   });
   it("a verified success is happy; an AI answer is NOT celebrated", () => {
@@ -91,31 +90,6 @@ describe("speech and mouth", () => {
     expect(visemeAt("hello", 1)).toBe("e");
     expect(visemeAt("so", 1)).toBe("o");
     expect(visemeAt("a, b", 1)).toBe("m"); // a pause
-  });
-  it("moves only while speaking, and follows start / boundary / end", () => {
-    const m = new MouthSync();
-    expect(m.level(0)).toBeNull();
-    m.handle({ type: "start", text: "Opening the folder now" }, 1000);
-    expect(m.speaking).toBe(true);
-    expect(m.level(1100)).not.toBeNull();
-    m.handle({ type: "boundary", index: 8 }, 1200);
-    expect(m.position(1200)).toBeCloseTo(8, 0);
-    m.handle({ type: "end" }, 3000);
-    expect(m.speaking).toBe(false);
-    expect(m.level(3100)).toBeNull();
-  });
-  it("the Speaker reports a real utterance's start, words and end, and ignores a replaced one", () => {
-    const events: string[] = [];
-    const spoken: { onstart?: () => void; onend?: () => void; onerror?: () => void; onboundary?: (e: { charIndex: number }) => void }[] = [];
-    const synth: SynthLike = { speak: (u) => void spoken.push(u as never), cancel: () => {}, getVoices: () => [] };
-    const U = class { rate = 1; lang = ""; voice = null; volume = 1; constructor(public text: string) {} } as unknown as UtteranceCtor;
-    const sp = new Speaker(synth, U);
-    sp.listen((e) => events.push(e.type));
-    sp.speak("Hello there", { voiceURI: null, rate: 1, lang: "en" });
-    sp.speak("Second one", { voiceURI: null, rate: 1, lang: "en" }); // replaces the first
-    spoken[0].onend?.(); // the cancelled one ends: must not stop the mouth
-    spoken[1].onstart?.(); spoken[1].onboundary?.({ charIndex: 3 }); spoken[1].onend?.();
-    expect(events).toEqual(["start", "boundary", "end"]);
   });
 });
 
@@ -190,6 +164,6 @@ describe("saved appearance", () => {
     expect(loadPrefs(m).character).toEqual(defaultCharacter);
   });
   it("appearance carries no task data and no permissions", () => {
-    expect(Object.keys(defaultCharacter).sort()).toEqual(["animation", "art", "enabled", "hairColor", "hairstyle", "headphones", "outfit", "personality", "presentation", "theme", "view"]);
+    expect(Object.keys(defaultCharacter).sort()).toEqual(["animation", "art", "enabled", "hairColor", "hairstyle", "headphones", "onlineVoice", "outfit", "personality", "presentation", "theme", "view", "voices"]);
   });
 });

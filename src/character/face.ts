@@ -5,7 +5,7 @@
  */
 export const EXPRESSIONS = [
   "idle", "calm", "friendly", "listening", "speaking", "thinking", "happy", "excited", "wink",
-  "confused", "surprised", "serious", "sad", "apologetic", "warning", "error",
+  "confused", "surprised", "serious", "sad", "apologetic", "warning", "error", "angry", "worried", "sleepy",
 ] as const;
 export type ExpressionId = (typeof EXPRESSIONS)[number];
 
@@ -59,6 +59,9 @@ export const EXPRESSION_DEFS: Record<ExpressionId, ExpressionDef> = {
   sad: d({ openL: 0.78, openR: 0.78, gazeY: 0.45, browL: 0.1, browR: 0.1, tilt: 0.65, smile: -0.6, wide: 0.7, blush: 0, tear: 0.7, headRoll: 3, headDY: 3, energy: 0.25 }),
   apologetic: d({ openL: 0.82, openR: 0.82, gazeY: 0.3, browL: 0.2, browR: 0.2, tilt: 0.7, smile: -0.12, wide: 0.7, blush: 0.3, sweat: 0.7, headRoll: -3, headDY: 2, energy: 0.3 }),
   warning: d({ openL: 1.02, openR: 1.02, browL: 0.3, browR: 0.3, tilt: -0.25, smile: -0.3, open: 0.15, wide: 0.8, blush: 0, sweat: 0.8, energy: 0.5 }, "!", "warn"),
+  angry: d({ openL: 0.78, openR: 0.78, browL: -0.2, browR: -0.2, tilt: -0.95, smile: -0.55, wide: 0.9, open: 0.12, blush: 0.1, energy: 0.8 }, "none"),
+  worried: d({ openL: 0.95, openR: 0.95, gazeY: 0.15, browL: 0.35, browR: 0.35, tilt: 0.85, smile: -0.35, wide: 0.75, sweat: 0.5, headRoll: -2, energy: 0.5 }),
+  sleepy: d({ openL: 0.18, openR: 0.18, browL: -0.1, browR: -0.1, smile: 0.05, wide: 0.7, blush: 0.1, headRoll: 5, headDY: 4, energy: 0.2 }),
   error: d({ openL: 0.9, openR: 0.9, browL: 0.15, browR: 0.15, tilt: 0.4, smile: -0.5, open: 0.28, wide: 0.85, blush: 0, sweat: 1, headRoll: -2, energy: 0.4 }, "!", "bad"),
 };
 

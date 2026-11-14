@@ -9,12 +9,12 @@ import path from "node:path";
  *  - the only thing every role may use is shared/.
  */
 const root = path.resolve(__dirname, "../runtime-core");
-const ROLES = ["orchestrator", "desktop", "vision", "uipanel", "filesystem", "apps", "browser", "action", "verifier"] as const;
+const ROLES = ["orchestrator", "desktop", "vision", "uipanel", "filesystem", "apps", "browser", "action", "verifier", "languageTeacher"] as const;
 type Role = (typeof ROLES)[number];
 
 /** Which other roles each role may depend on. The orchestrator coordinates, so it may use all of them. */
 const MAY_USE: Record<Role, Role[]> = {
-  orchestrator: ["desktop", "vision", "uipanel", "filesystem", "apps", "browser", "action", "verifier"],
+  orchestrator: ["desktop", "vision", "uipanel", "filesystem", "apps", "browser", "action", "verifier", "languageTeacher"],
   desktop: ["verifier"], // records what it saw in the world model
   vision: ["verifier"],
   uipanel: ["verifier"],
@@ -23,6 +23,7 @@ const MAY_USE: Record<Role, Role[]> = {
   browser: [],
   action: [],
   verifier: ["desktop", "filesystem"], // judges their results
+  languageTeacher: [], // plays one role of a conversation: no desktop, no other role
 };
 
 const walk = (d: string): string[] =>
@@ -81,7 +82,7 @@ describe("the nine agent roles", () => {
   it("each role has a matching helper agent that names its folder", () => {
     const helpers: Record<Role, string> = {
       orchestrator: "momo-orchestrator", desktop: "momo-desktop", vision: "momo-vision", uipanel: "momo-ui-panel", filesystem: "momo-filesystem",
-      apps: "momo-apps", browser: "momo-browser", action: "momo-action", verifier: "momo-verifier",
+      apps: "momo-apps", browser: "momo-browser", action: "momo-action", verifier: "momo-verifier", languageTeacher: "momo-language-teacher",
     };
     for (const r of ROLES) {
       const md = fs.readFileSync(path.resolve(root, "../../.claude/agents", `${helpers[r]}.md`), "utf8");

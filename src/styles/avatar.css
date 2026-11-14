@@ -1,0 +1,29 @@
+/* Animated avatar: every layer shares the base picture's box, so the eye and mouth areas (fractions of the picture) always line up. */
+.avatar-rig { position: relative; width: 100%; height: 100%; display: flex; align-items: flex-end; justify-content: center; container-type: size; pointer-events: none; }
+.avatar-fig { position: relative; display: block; max-width: 100cqw; max-height: 100cqh; transform-origin: 50% 100%; will-change: transform; }
+.avatar-base { display: block; max-width: 100cqw; max-height: 100cqh; width: auto; height: auto; user-select: none; -webkit-user-drag: none; animation: avatar-fade .24s ease-out; }
+.avatar-layer { position: absolute; inset: 0; width: 100%; height: 100%; user-select: none; -webkit-user-drag: none; }
+.avatar-prev { animation: avatar-gone .26s ease-in forwards; z-index: 1; }
+.avatar-glyph { position: absolute; right: 4%; top: 2%; font: 800 22px "Segoe UI", "Segoe UI Emoji", sans-serif; opacity: 0; text-shadow: 0 0 6px rgba(0,0,0,.45); }
+.dock.expanded .avatar-glyph { font-size: 34px; }
+@keyframes avatar-fade { from { opacity: 0; } to { opacity: 1; } }
+@keyframes avatar-gone { from { opacity: 1; } to { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) { .avatar-base, .avatar-prev { animation: none; } }
+
+/* The speech cloud: what Momo is saying, beside the avatar. Never takes the mouse. */
+.dock .cloud { position: absolute; left: calc(100% + 14px); bottom: 38%; z-index: 3; }
+.cloud { --cloud: #fff; box-sizing: border-box; pointer-events: none; position: relative; width: max-content; max-width: 210px; padding: 12px 17px; color: #2a2e45; background: var(--cloud);
+  border-radius: 34px 38px 36px 32px / 30px 34px 36px 32px; font: 700 13.5px/1.35 "Segoe UI Variable", "Segoe UI", system-ui, sans-serif; text-align: center;
+  box-shadow: 0 8px 22px rgba(20, 24, 60, .28); animation: cloud-in .22s ease-out; }
+/* soft bumps on the top edge and a trail of small puffs toward the avatar, like the reference cloud */
+.cloud::before { content: ""; position: absolute; left: 14%; top: -9px; width: 34%; height: 22px; background: var(--cloud); border-radius: 50%; box-shadow: 70px -2px 0 -3px var(--cloud); }
+.cloud::after { content: ""; position: absolute; left: -13px; bottom: 6px; width: 15px; height: 15px; background: var(--cloud); border-radius: 50%; box-shadow: -11px 9px 0 -4px var(--cloud); }
+.dock.expanded .cloud { max-width: 248px; font-size: 14.5px; bottom: 52%; left: calc(100% + 16px); }
+.cloud-text { position: relative; z-index: 1; display: block; }
+.cloud mark { background: transparent; color: inherit; border-radius: 6px; box-shadow: 0 2px 0 #7a8cff; }
+.stage .stage-cloud { position: absolute; right: 8px; top: 14px; max-width: 52%; font-size: 13px; }
+@keyframes cloud-in { from { opacity: 0; transform: translateY(4px) scale(.96); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) { .cloud { animation: none; } }
+
+/* the drawn eyelids and mouth sit exactly over the avatar's resting face (same box as the picture) */
+.avatar-draw { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; transition: opacity .18s ease; }

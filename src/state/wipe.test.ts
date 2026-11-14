@@ -23,7 +23,7 @@ describe("delete everything Momo stored", () => {
     expect(loadPrefs(kv)).toEqual(defaultPrefs); // back to a first launch
     expect([...cacheNames]).toEqual(["other-site-cache"]); // only Momo's own cache is touched
     expect(shell).toBe(1);
-    expect(r.removed.join(" ")).toMatch(/settings.*speech model.*app storage/);
+    expect(r.removed.join(" ")).toMatch(/settings.*language-learning progress.*speech model.*app storage/);
     expect(r.failed).toEqual([]);
   });
 

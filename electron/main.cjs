@@ -12,6 +12,7 @@ const { createStt } = require("./stt.cjs");
 const { transcribeCloud } = require("./cloudStt.cjs");
 const appProtocol = require("./appProtocol.cjs");
 const envConfig = require("./env.cjs");
+const { synthOnline } = require("./onlineVoice.cjs");
 const path = require("node:path");
 const fs = require("node:fs");
 
@@ -51,7 +52,7 @@ function lockDown(w) {
 
 // ---- The bar: a passive indicator at the bottom centre of the screen. It never takes focus (so the text goes to the
 // app you were in) and never catches clicks.
-const BAR_SIZES = { compact: { width: 560, height: 440 }, expanded: { width: 560, height: 700 } };
+const BAR_SIZES = { compact: { width: 560, height: 440 }, expanded: { width: 820, height: 700 } };
 let barView = "compact";
 const BAR = { ...BAR_SIZES.compact, gap: 10 };
 function placeBar() {
@@ -73,7 +74,7 @@ function createBar() {
     webPreferences: secureWebPreferences(),
   });
   barWin.setAlwaysOnTop(true, "screen-saver");
-  barWin.setIgnoreMouseEvents(true);
+  barWin.setIgnoreMouseEvents(true, { forward: true }); // click-through, but the page still hears the pointer so it can ask for the mouse over a button
   placeBar();
   lockDown(barWin);
   barWin.once("ready-to-show", () => barWin && barWin.showInactive());
@@ -137,6 +138,28 @@ ipcMain.on("momo:open-settings", (e) => { if (fromOurWindow(e)) openSettings(); 
 ipcMain.on("momo:bar-interactive", (e, on) => {
   if (!fromBar(e) || typeof on !== "boolean" || !barWin || barWin.isDestroyed()) return;
   barWin.setIgnoreMouseEvents(!on, { forward: true });
+});
+// The bar reports where its buttons and cards are; while there are any, the real pointer is watched and the window takes the
+// mouse ONLY while the pointer is over one of them. Everywhere else the mouse goes through to the windows underneath.
+let barHit = [];
+let barHitTimer = null;
+let barOver = false;
+function barPointerCheck() {
+  if (!barWin || barWin.isDestroyed() || !barWin.isVisible()) return;
+  const p = screen.getCursorScreenPoint();
+  const b = barWin.getBounds();
+  const over = barHit.some((r) => p.x >= b.x + r.x && p.x <= b.x + r.x + r.w && p.y >= b.y + r.y && p.y <= b.y + r.y + r.h);
+  if (over !== barOver) { barOver = over; barWin.setIgnoreMouseEvents(!over, { forward: true }); }
+}
+ipcMain.on("momo:bar-hit-rects", (e, rects) => {
+  if (!fromBar(e) || !Array.isArray(rects) || rects.length > 12) return;
+  const clean = rects.filter((r) => r && [r.x, r.y, r.w, r.h].every((n) => Number.isFinite(n) && Math.abs(n) < 5000)).map((r) => ({ x: r.x, y: r.y, w: r.w, h: r.h }));
+  barHit = clean;
+  if (clean.length && !barHitTimer) barHitTimer = setInterval(barPointerCheck, 50);
+  if (!clean.length) {
+    if (barHitTimer) { clearInterval(barHitTimer); barHitTimer = null; }
+    if (barOver && barWin && !barWin.isDestroyed()) { barOver = false; barWin.setIgnoreMouseEvents(true, { forward: true }); }
+  }
 });
 // Compact (a small face above the pill) or expanded (the character, larger). The window stays transparent and click-through.
 ipcMain.on("momo:bar-layout", (e, view) => {
@@ -285,6 +308,18 @@ ipcMain.on("momo:submit-transcript", (e, p) => {
   void runtime.handleTranscript(p.sessionId.slice(0, 128), p.text.slice(0, 2000));
 });
 ipcMain.on("momo:cancel-task", (e) => { if (fromOurWindow(e)) { runtime?.cancelTask(); pointer?.disarm(); shadow?.cancel(); } });
+// The Language Teacher (a specialist role of the runtime): the other side of a roleplay interview, one line per call. The runtime
+// validates the request and the AI's reply; the page keeps the conversation and the learner's progress.
+ipcMain.handle("momo:language-converse", async (e, req) => {
+  if (!fromOurWindow(e)) return { ok: false, message: "Not allowed.", retryable: false };
+  if (!runtime) return { ok: false, message: "Momo's runtime isn't running. Rebuild it with npm run build:runtime.", retryable: false };
+  try { return await runtime.converse(req); } catch { return { ok: false, message: "The interview partner could not answer. Try again.", retryable: true }; }
+});
+// The learner's progress as a short text, so the orchestrator can answer "what should I study next?" (kept in memory only).
+ipcMain.on("momo:language-summary", (e, text) => {
+  if (!fromOurWindow(e) || typeof text !== "string") return;
+  runtime?.setLanguageSummary(text.slice(0, 600));
+});
 // The Confirm/Cancel buttons. The runtime ignores ids that don't match the question that is actually open.
 ipcMain.on("momo:respond-confirmation", (e, p) => {
   if (!fromOurWindow(e) || !p || typeof p.taskId !== "string" || typeof p.approved !== "boolean") return;
@@ -311,7 +346,7 @@ ipcMain.handle("momo:stt-load", async (e) => {
   }
 });
 ipcMain.handle("momo:stt-transcribe", async (e, p) => {
-  if (!fromBar(e)) return { ok: false, reason: "Not allowed." };
+  if (!fromOurWindow(e)) return { ok: false, reason: "Not allowed." };
   if (!p || !(p.audio instanceof Float32Array) || typeof p.language !== "string" || !/^([a-z]{2,3}|auto)$/.test(p.language)) return { ok: false, reason: "Bad request." };
   let note;
   // Cloud speech (only when the user chose it and a Groq key is set): the most accurate. If it fails (offline, limit), use the local model.
@@ -329,6 +364,22 @@ ipcMain.handle("momo:stt-transcribe", async (e, p) => {
   } catch {
     return { ok: false, reason: "The speech engine could not read that." };
   }
+});
+
+// ---- Online voices (optional, ElevenLabs): the page sends what Momo is about to say and a voice id; the KEY never leaves this process.
+// Used only while ELEVENLABS_API_KEY is set (see onlineVoice.cjs). A daily character budget keeps it inside the free tier; when the service refuses or is
+// unreachable the page just speaks with the Windows voice instead. Only text is sent, and nothing is stored but the day's character count.
+const voiceUsageFile = () => path.join(app.getPath("userData"), "voice-usage.json");
+function voiceBudget(limitText) {
+  const limit = Number(limitText) || 3000;
+  let used = 0;
+  try { const j = JSON.parse(fs.readFileSync(voiceUsageFile(), "utf8")); if (j.date === localDate()) used = Number(j.chars) || 0; } catch { /* none yet */ }
+  return { limit, used, spend(n) { try { fs.writeFileSync(voiceUsageFile(), JSON.stringify({ date: localDate(), chars: used + n })); } catch { /* non-fatal */ } } };
+}
+ipcMain.handle("momo:tts-online", async (e, p) => {
+  if (!fromOurWindow(e)) return { ok: false, reason: "Not allowed." };
+  if (!p || typeof p.text !== "string" || typeof p.voiceId !== "string") return { ok: false, reason: "Bad request." };
+  return synthOnline({ key: envValues.ELEVENLABS_API_KEY, text: p.text, voiceId: p.voiceId, budget: voiceBudget(envValues.MOMO_VOICE_MAX_CHARS_PER_DAY) });
 });
 
 // ---- Dictation: what was said -> clean text -> written into a field that was FOUND, FOCUSED and CHECKED (see targeting.cjs).
@@ -464,6 +515,7 @@ ipcMain.handle("momo:wipe-data", async (e) => {
     runtime?.cancelTask();
     getStt().deleteModel(); // the downloaded speech model
     try { fs.unlinkSync(usageFile()); } catch { /* nothing was saved */ }
+    try { fs.unlinkSync(voiceUsageFile()); } catch { /* nothing was saved */ }
     await session.defaultSession.clearStorageData();
     await session.defaultSession.clearCache();
     return { ok: true };

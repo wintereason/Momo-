@@ -110,6 +110,19 @@ export function Connections() {
         </div>
       </section>
 
+      <section className="panel">
+        <h2>Online avatar voices (optional)</h2>
+        <div className="key-row">
+          <div className="key-head"><strong>ElevenLabs key</strong><span className={s.speech.onlineVoiceKey ? "badge ok" : "badge"}>{s.speech.onlineVoiceKey ? "✓ Saved" : "Not set"}</span></div>
+          <small className="muted">Gives each avatar its own online voice. While a key is saved, what Momo SAYS (never what you dictate) is sent to ElevenLabs, within a daily character limit; if it fails, the Windows voice speaks. Free tier at <code>elevenlabs.io</code>. Leave empty to keep every voice on this PC.</small>
+          <div className="key-input">
+            <input type="password" autoComplete="off" spellCheck={false} placeholder={s.speech.onlineVoiceKey ? "Paste a new value to replace it" : "sk_…"} value={draft.ELEVENLABS_API_KEY ?? ""} onChange={(e) => setDraft({ ...draft, ELEVENLABS_API_KEY: e.target.value })} aria-label="ElevenLabs key" />
+            <button className="primary" disabled={busy || !(draft.ELEVENLABS_API_KEY ?? "").trim()} onClick={() => void save({ ELEVENLABS_API_KEY: draft.ELEVENLABS_API_KEY }, "Online voice key saved.")}>Save</button>
+            {s.speech.onlineVoiceKey && <button disabled={busy} onClick={() => void save({ ELEVENLABS_API_KEY: "" }, "Online voice key removed.")}>Remove</button>}
+          </div>
+        </div>
+      </section>
+
       <p className="hint">Saved in <code>{s.files.length ? s.files.join(", ") : "Momo/.env"}</code> on this PC. <button className="link" onClick={reread} disabled={busy}>Re-read the file</button> if you edited it by hand.</p>
     </div>
   );

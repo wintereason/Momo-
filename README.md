@@ -23,7 +23,6 @@ momo-project/
 │   ├── reference/                 <- original images (visual reference only, NOT 3D models)
 │   │   ├── character_sheet_expressions.png
 │   │   ├── group_bench_scene.png
-│   │   ├── avatar_sheet_pink.png  <- supplied 3x2 expression sheet (pink-haired girl)
 │   │   └── avatar_sheet_dark.png  <- supplied 3x2 expression sheet (dark-haired boy)
 │   ├── avatars/<art>/{head,full}/ <- cut-out sprites from those two sheets (checked in, built by a script)
 │   ├── characters/<id>/           <- cut-out expression PNGs go here (see ASSET_GUIDE.md)
@@ -63,9 +62,9 @@ cherry petals, and the character with state effects (mic waves, thought dots, st
   `node scripts/scene-contact-sheet.cjs <id> <view>`.
 
 ### Avatar art
-The character on the bar can be the hand-drawn Momo or one of the two supplied 3D-style avatar sheets (pink-haired
-girl, dark-haired boy). Settings → Character → **Avatar art** switches between `drawn`, `pink` and `dark`; `pink` is
-the default.
+The character on the bar can be the hand-drawn Momo, the dark-haired boy from the supplied avatar sheet, or the black-bob girl cut
+from the reference videos. Settings → Character → **Avatar art** switches between `drawn`, `dark` and `bob`; `dark` is
+the default (the pink-haired avatar was removed; saved choices of it fall back to `dark`).
 
 - Each sheet is 3 columns × 2 rows = six drawn faces. Momo maps every semantic expression (listening, thinking,
   happy, sad, …) to the closest drawn face, so it never shows a face the artist did not draw. The compact bar uses a

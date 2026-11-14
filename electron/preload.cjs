@@ -17,6 +17,12 @@ contextBridge.exposeInMainWorld("momoDesktop", {
   barInteractive: (on) => ipcRenderer.send("momo:bar-interactive", on === true),
   /** the bar window's size: "compact" (small face above the pill) or "expanded" (the character, larger) */
   setBarLayout: (view) => ipcRenderer.send("momo:bar-layout", view === "expanded" ? "expanded" : "compact"),
+  /** where the bar's buttons and cards are (window pixels): the shell lets the mouse through everywhere else */
+  setBarHitRects: (rects) => ipcRenderer.send("momo:bar-hit-rects", Array.isArray(rects) ? rects.slice(0, 12).map((r) => ({ x: Number(r.x), y: Number(r.y), w: Number(r.w), h: Number(r.h) })) : []),
+  /** the Language Teacher plays the other role of a roleplay interview (one line per call) */
+  languageConverse: (req) => ipcRenderer.invoke("momo:language-converse", req),
+  /** the learner's progress as short text, for the orchestrator's read-only learning tool */
+  setLanguageSummary: (text) => ipcRenderer.send("momo:language-summary", String(text).slice(0, 600)),
   quit: () => ipcRenderer.send("momo:quit"),
 
   /** The user started speaking: check in the background whether the field in front is a password box. */
@@ -61,6 +67,8 @@ contextBridge.exposeInMainWorld("momoDesktop", {
   },
   /** 16 kHz mono audio (Float32Array) -> text. The audio is only passed along in memory. Resolves { ok, text?, reason? }. */
   sttTranscribe: (audio, language, engine) => ipcRenderer.invoke("momo:stt-transcribe", { audio, language: String(language), engine: engine === "cloud" ? "cloud" : "local" }),
+  /** Online voice (ElevenLabs, only while its key is set in .env): text + voice id -> { ok, audio (mp3 bytes) } or { ok:false, reason }. The key never reaches the page. */
+  ttsOnline: (text, voiceId) => ipcRenderer.invoke("momo:tts-online", { text: String(text).slice(0, 600), voiceId: String(voiceId) }),
   /** The shadow-cursor window: what to draw. The shell sends only these shapes; they are checked again here. */
   onCursor: (cb) => {
     const num = (v) => (Number.isFinite(v) ? Math.max(-30000, Math.min(30000, v)) : 0);

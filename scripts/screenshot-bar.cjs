@@ -1,5 +1,5 @@
 // Screenshots the dictation bar with a given character (dev server on :5173).
-//   CHAR='{"art":"pink","view":"compact"}' npx electron scripts/screenshot-bar.cjs <outDir> [prefix]
+//   CHAR='{"art":"dark","view":"compact"}' npx electron scripts/screenshot-bar.cjs <outDir> [prefix]
 const { app, BrowserWindow } = require("electron");
 const path = require("path"), fs = require("fs");
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));

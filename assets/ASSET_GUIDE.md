@@ -5,7 +5,6 @@
 - `reference/group_bench_scene.png` — all five characters together; style reference for the cherry-blossom theme.
 
 ## Avatar sheets (supplied art, shipped)
-- `reference/avatar_sheet_pink.png` — pink/blue-haired girl with glasses and a gradient dress, 3 columns × 2 rows.
 - `reference/avatar_sheet_dark.png` — dark-haired boy with glasses and a black hoodie, 3 columns × 2 rows.
 
 Both are 1024×1024 renders of a chibi 3D “AVATAR 3D” figurine on a pale studio set with a rounded display base.

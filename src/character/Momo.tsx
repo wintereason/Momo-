@@ -34,7 +34,7 @@ interface Anim {
   nextBlink: number; blinkAt: number; doubleBlink: boolean;
   glyph: Glyph; glyphAlpha: number; glyphWant: Glyph;
   winkUntil: number; nextWink: number;
-  last: number; paint: number;
+  last: number; paint: number; wasSpeaking: boolean;
 }
 
 export function Momo({ appearance, expression, mouth, view = "compact", className }: MomoProps) {
@@ -59,7 +59,7 @@ export function Momo({ appearance, expression, mouth, view = "compact", classNam
       face: { ...target0.face }, mouth: { open: target0.face.open, round: target0.face.round, wide: target0.face.wide },
       nextBlink: start + 1500, blinkAt: -1, doubleBlink: false,
       glyph: target0.glyph, glyphAlpha: target0.glyph === "none" ? 0 : 1, glyphWant: target0.glyph,
-      winkUntil: 0, nextWink: start + 20000 + Math.random() * 15000, last: start, paint: 0,
+      winkUntil: 0, nextWink: start + 20000 + Math.random() * 15000, last: start, paint: 0, wasSpeaking: false,
     };
     let raf = 0;
     let running = true;
@@ -89,7 +89,10 @@ export function Momo({ appearance, expression, mouth, view = "compact", classNam
 
       a.face = motion.ease ? easeFace(a.face, def.face, dt, 9) : { ...def.face };
       const m = speakingLevel ?? { open: def.face.open, round: def.face.round, wide: def.face.wide };
-      const k = speakingLevel ? 24 : 9;
+      // the mouth follows speech closely, and when speech ends it goes back to the expression in the same frame
+      if (!speakingLevel && a.wasSpeaking) a.mouth = { open: def.face.open, round: def.face.round, wide: def.face.wide };
+      a.wasSpeaking = speakingLevel !== null;
+      const k = speakingLevel ? 40 : 9;
       a.mouth = motion.ease
         ? { open: ease(a.mouth.open, m.open, dt, k), round: ease(a.mouth.round, m.round, dt, k), wide: ease(a.mouth.wide, m.wide * (speakingLevel ? def.face.wide : 1), dt, k) }
         : { ...m };

@@ -95,11 +95,11 @@ describe("only FREE services", () => {
   it("no paid provider or paid art/speech service can be configured", () => {
     expect(PROVIDERS.sort()).toEqual(["gemini", "groq", "ollama", "openrouter"]);
     const names = Object.keys(KEYS).join(" ");
-    for (const paid of ["ANTHROPIC", "OPENAI", "DEEPGRAM", "AZURE", "ELEVENLABS", "STABILITY", "REPLICATE", "MESHY", "TRIPO"]) {
+    for (const paid of ["ANTHROPIC", "OPENAI", "DEEPGRAM", "AZURE", "STABILITY", "REPLICATE", "MESHY", "TRIPO"]) {
       expect(names, paid).not.toContain(paid);
     }
     const text = fs.readFileSync(path.join(root, ".env.example"), "utf8");
-    for (const paid of ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPGRAM", "ELEVENLABS", "STABILITY_API_KEY", "REPLICATE_API_TOKEN"]) {
+    for (const paid of ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "DEEPGRAM", "STABILITY_API_KEY", "REPLICATE_API_TOKEN"]) {
       expect(text, paid).not.toContain(paid);
     }
   });
@@ -113,7 +113,7 @@ describe("the .env.example template and the loader agree", () => {
     expect(Object.keys(tpl).sort()).toEqual(Object.keys(KEYS).sort());
   });
   it("ships with no secrets: every key empty except harmless defaults", () => {
-    const defaults = { MOMO_AI_ENABLED: "false", MOMO_AI_PROVIDER: "gemini", OLLAMA_HOST: "http://localhost:11434", MOMO_AI_MAX_OUTPUT_TOKENS: "800", MOMO_AI_MAX_REQUESTS_PER_DAY: "200", MOMO_AI_ALLOW_SCREEN_CONTEXT: "false" };
+    const defaults = { MOMO_AI_ENABLED: "false", MOMO_AI_PROVIDER: "gemini", OLLAMA_HOST: "http://localhost:11434", MOMO_AI_MAX_OUTPUT_TOKENS: "800", MOMO_AI_MAX_REQUESTS_PER_DAY: "200", MOMO_AI_ALLOW_SCREEN_CONTEXT: "false", MOMO_VOICE_MAX_CHARS_PER_DAY: "3000" };
     for (const [k, v] of Object.entries(tpl)) expect(v, k).toBe(defaults[k] ?? "");
     expect(load({ files: [path.join(root, ".env.example")], processEnv: {} }).values).toEqual(defaults);
     expect(problems(defaults)).toEqual([]);
@@ -140,5 +140,22 @@ describe("the .env.example template and the loader agree", () => {
     expect(g).toContain(".env");
     expect(g).toContain(".env.*");
     expect(g).toContain("!.env.example");
+  });
+});
+
+describe("the optional online avatar voice key", () => {
+  it("is a secret that the page can only save, and the status shows only yes/no", () => {
+    expect(KEYS.ELEVENLABS_API_KEY.kind).toBe("secret");
+    const values = { ELEVENLABS_API_KEY: "sk_0123456789abcdef0123456789abcdef" };
+    const s = status(values, []);
+    expect(s.speech.onlineVoiceKey).toBe(true);
+    expect(JSON.stringify(s)).not.toContain("sk_0123");
+    expect(status({}, []).speech.onlineVoiceKey).toBe(false);
+    expect(problems({ ELEVENLABS_API_KEY: "bad key!" }).join(" ")).toContain("ELEVENLABS_API_KEY looks wrong");
+    expect(problems(values)).toEqual([]);
+  });
+  it("is the only paid-looking service allowed, and stays empty in the template", () => {
+    expect(PROVIDERS.sort()).toEqual(["gemini", "groq", "ollama", "openrouter"]); // the AI brain is still free-only
+    expect(parse(fs.readFileSync(path.join(root, ".env.example"), "utf8")).ELEVENLABS_API_KEY).toBe("");
   });
 });
