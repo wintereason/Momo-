@@ -149,4 +149,18 @@ describe("the long-lived UI Automation helper process", () => {
     // nothing that looks like an obfuscated launcher (Windows Defender refuses to start those)
     expect(HELPER_SCRIPT).not.toMatch(/FromBase64String|Invoke-Expression|iex/i);
   });
+
+  // The C# inside the script is only compiled by Windows PowerShell: a typo in it silently turns the helper off (everything falls back to the slow script).
+  it.runIf(process.platform === "win32")("the REAL script compiles and answers (ping, window state with hung + modal facts)", async () => {
+    const h = new UiaHost();
+    try {
+      expect(await h.request("ping", 30_000)).toMatchObject({ ok: true });
+      const wins = await h.request<{ windows: Array<{ hwnd: number }> }>("windows", 10_000);
+      const st = await h.request<{ ok: boolean; exists: boolean; hung: boolean; modal: boolean }>(`state ${wins.windows[0]?.hwnd ?? 0}`, 10_000);
+      expect(st.ok).toBe(true);
+      expect(typeof st.hung).toBe("boolean");
+      expect(typeof st.modal).toBe("boolean");
+      expect(h.stats().failures).toBe(0);
+    } finally { h.stop(); }
+  }, 40_000);
 });

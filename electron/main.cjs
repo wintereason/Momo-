@@ -225,7 +225,11 @@ let lastTaskId = null;
 let taskWorking = false; // a task is running right now (the pointer is created lazily, after "working" was announced)
 function getPointer() {
   if (!pointer) {
+    const deadman = require("./deadman.cjs");
+    deadman.start(); // only if this process is killed outright: it lets go of whatever Momo holds (see deadman.cjs)
     pointer = require("./humanInput.cjs").createPointer(require("koffi"), {
+      // mirror exactly what is held (button names + key codes, nothing else) so a killed app can still let go
+      onHeld: (held) => { try { deadman.report(held); } catch { /* the ledger still works without the mirror */ } },
       // the ghost sits exactly where the REAL pointer is, at every step, so the two can never drift apart
       onTrack: (t) => { try { getShadow().track(t); } catch { /* decoration */ } },
       // THE USER ALWAYS WINS: they moved the physical mouse or pressed Esc. Stop the whole task now, not just this click.

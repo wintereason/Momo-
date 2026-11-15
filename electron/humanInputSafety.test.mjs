@@ -235,12 +235,11 @@ describe("interrupted drag: cancelled, never dropped", () => {
     expect({ x: w.os.x, y: w.os.y }).toEqual({ x: 200, y: 200 });
     expect(nothingHeld(w)).toBe(true);
   });
-  it("the origin-only strategy returns to the start and releases there, without sending Esc", async () => {
+  it("an origin-only request is not honoured on its own: Esc is always sent first (real Explorer dropped the file when only the pointer was returned)", async () => {
     const w = dragWorld("origin");
     afterDown(w, () => w.pointer.abort("cancel"));
     await w.pointer.drag({ x: 200, y: 200 }, { x: 800, y: 500 }, { ms: 400, expectRoot: 7 });
-    expect(w.os.log.includes("kd:1b")).toBe(false);
-    expect({ x: w.os.x, y: w.os.y }).toEqual({ x: 200, y: 200 });
+    expect(escBeforeUp(w)).toBe(true);
     expect(nothingHeld(w)).toBe(true);
   });
   it("the target window closes mid-drag: the drag is cancelled, not dropped, and the reason is 'gone'", async () => {
@@ -481,5 +480,130 @@ describe("scrolling stops when something opens over the page", () => {
     const r = await w.pointer.scroll(400, 300, 6, { ms: 200, expectRoot: 7 });
     expect(r).toEqual({ ok: false, reason: "covered" });
     expect(w.os.wheelCount).toBe(1);
+  });
+});
+
+describe("acted: did any input reach the app? (the facts the recovery layer relies on)", () => {
+  it("moving the pointer is not acting: a click refused before the press says 'no'", async () => {
+    const w = world();
+    w.pointer.arm(); w.pointer.resetActed();
+    w.os.root = 99; // covered
+    expect(await w.pointer.click(300, 300, { ms: 200, expectRoot: 7 })).toEqual({ ok: false, reason: "covered" });
+    expect(w.pointer.actedSince()).toBe("no");
+  });
+  it("every refusal that happens before a button goes down is 'no'", async () => {
+    const refusals = [
+      (w) => { w.os.root = 99; return w.pointer.click(300, 300, { ms: 200, expectRoot: 7 }); },
+      (w) => w.pointer.click(300, 300, { ms: 200, verifyTarget: async () => ({ ok: false, reason: "changed" }) }),
+      (w) => w.pointer.click(300, 300, { ms: 200, verifyTarget: async () => { throw new Error("x"); } }),
+      (w) => { w.os.windows.delete(7); return w.pointer.click(300, 300, { ms: 200, expectWindow: { hwnd: 7, rect: { l: 0, t: 0, w: 1000, h: 800 } } }); },
+      (w) => { w.os.userLeft = true; return w.pointer.click(300, 300, { ms: 200 }); },
+      (w) => { w.os.fg = 99; return w.pointer.type("abc", 1, { expectForeground: 7 }); },
+      (w) => { w.os.userKeys.add(0x10); return w.pointer.press("ctrl+a"); },
+    ];
+    for (const run of refusals) {
+      const w = world(); w.pointer.arm(); w.pointer.resetActed();
+      const r = await run(w);
+      expect(r.ok).toBe(false);
+      expect(w.pointer.actedSince()).toBe("no");
+    }
+  });
+  it("a delivered click, key chord, wheel notch and typed character are 'yes'", async () => {
+    for (const run of [
+      (p) => p.click(300, 300, { ms: 200, expectRoot: 7 }),
+      (p) => p.click(300, 300, { ms: 200, expectRoot: 7, button: "right" }),
+      (p) => p.press("ctrl+a"),
+      (p) => p.scroll(400, 300, 1, { ms: 200, expectRoot: 7 }),
+      (p) => p.type("a", 1),
+      (p) => p.drag({ x: 200, y: 200 }, { x: 400, y: 300 }, { ms: 200, expectRoot: 7 }),
+    ]) {
+      const w = world(); w.pointer.arm(); w.pointer.resetActed();
+      expect((await run(w.pointer)).ok).toBe(true);
+      expect(w.pointer.actedSince()).toBe("yes");
+    }
+  });
+  it("an error thrown WHILE sending is 'maybe' (the press may already have gone through), never 'no'", async () => {
+    for (const [name, run] of [
+      ["mouseDown", (p) => p.click(300, 300, { ms: 200, expectRoot: 7 })],
+      ["keyDown", (p) => p.press("enter")],
+      ["wheel", (p) => p.scroll(400, 300, 2, { ms: 200, expectRoot: 7 })],
+      ["unit", (p) => p.type("ab", 1)],
+    ]) {
+      const w = world(); w.os.fail = { name, at: 1, when: "before", times: 1 };
+      w.pointer.arm(); w.pointer.resetActed();
+      const r = await run(w.pointer);
+      expect(r.ok, name).toBe(false);
+      expect(w.pointer.actedSince(), name).toBe("maybe");
+      expect(nothingHeld(w)).toBe(true);
+    }
+  });
+  it("an error AFTER the input went through still says 'maybe' at least, and 'yes' once it was delivered", async () => {
+    const w = world(); w.os.fail = { name: "mouseDown", at: 1, when: "after", times: 1 };
+    w.pointer.arm(); w.pointer.resetActed();
+    await w.pointer.click(300, 300, { ms: 200, expectRoot: 7 });
+    expect(["maybe", "yes"]).toContain(w.pointer.actedSince());
+  });
+  it("input Windows refused outright (SendInput returned false) is put back to what it was", async () => {
+    // a refused wheel (returns false) is reported as a failure, and nothing was sent
+    const refused = createPointerFrom({
+      pos: () => ({ x: 1, y: 1 }), setPos: () => {}, escDown: () => false, windowAt: () => 7, classAt: () => "", windowRect: () => ({ l: 0, t: 0, w: 9, h: 9 }),
+      mouseDown: () => true, mouseUp: () => {}, nudge: () => {}, keyDown: () => {}, keyUp: () => {}, unit: () => false, wheel: () => false,
+    }, { wait: async () => {} });
+    refused.arm(); refused.resetActed();
+    expect((await refused.scroll(1, 1, 2, { ms: 120, expectRoot: 7 })).ok).toBe(false);
+    expect(refused.actedSince()).toBe("no");
+    expect((await refused.type("a", 1)).ok).toBe(false);
+    expect(refused.actedSince()).toBe("no");
+  });
+  it("it accumulates across steps until reset: a delivered click followed by a refused key is still 'yes'", async () => {
+    const w = world(); w.pointer.arm(); w.pointer.resetActed();
+    await w.pointer.click(300, 300, { ms: 200, expectRoot: 7 });
+    w.os.fg = 99;
+    expect((await w.pointer.press("ctrl+a", { expectForeground: 7 })).ok).toBe(false);
+    expect(w.pointer.actedSince()).toBe("yes");
+    w.pointer.resetActed();
+    expect(w.pointer.actedSince()).toBe("no");
+  });
+  it("Esc to cancel a drag does not make a refused drag look like it acted", async () => {
+    const w = world(); w.pointer.arm(); w.pointer.resetActed();
+    w.os.root = 99;
+    await w.pointer.drag({ x: 200, y: 200 }, { x: 400, y: 300 }, { ms: 200, expectRoot: 7 });
+    expect(w.pointer.actedSince()).toBe("no");
+  });
+});
+
+describe("a family of windows (phase 5: a click inside a dialog or popup is 'in' that window, not in its owner)", () => {
+  it("expectRoot may be a list: the pointer is fine over any window of the family", async () => {
+    const w = world();
+    w.os.root = 55; // the dialog
+    w.pointer.arm();
+    expect(await w.pointer.click(300, 300, { ms: 200, expectRoot: [7, 55, 56] })).toEqual({ ok: true });
+  });
+  it("...and refused over anything outside it, with no press", async () => {
+    const w = world();
+    w.os.root = 99;
+    w.pointer.arm();
+    expect(await w.pointer.click(300, 300, { ms: 200, expectRoot: [7, 55, 56] })).toEqual({ ok: false, reason: "covered" });
+    expect(w.os.log.some((l) => l.startsWith("down"))).toBe(false);
+  });
+  it("an empty family and 'no window' never match", async () => {
+    const w = world();
+    w.pointer.arm();
+    expect(await w.pointer.click(300, 300, { ms: 200, expectRoot: [] })).toEqual({ ok: false, reason: "covered" }); // an empty family is an unknown family: nothing is acceptable, so nothing is clicked
+    const v = world(); v.os.root = 0; v.pointer.arm();
+    expect(await v.pointer.click(300, 300, { ms: 200, expectRoot: [7, 8] })).toEqual({ ok: false, reason: "covered" });
+  });
+  it("a single window still works exactly as before", async () => {
+    const w = world(); w.pointer.arm();
+    expect(await w.pointer.click(300, 300, { ms: 200, expectRoot: 7 })).toEqual({ ok: true });
+    const v = world(); v.os.root = 8; v.pointer.arm();
+    expect(await v.pointer.click(300, 300, { ms: 200, expectRoot: 7 })).toEqual({ ok: false, reason: "covered" });
+  });
+  it("typing and shortcuts accept a family of windows for the keyboard focus", async () => {
+    const w = world(); w.os.fg = 56; w.pointer.arm();
+    expect((await w.pointer.press("down", { expectForeground: [7, 56] })).ok).toBe(true);
+    expect((await w.pointer.type("a", 1, { expectForeground: [7, 56] })).ok).toBe(true);
+    w.os.fg = 99;
+    expect(await w.pointer.press("down", { expectForeground: [7, 56] })).toEqual({ ok: false, reason: "focus_changed" });
   });
 });

@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
+import type { MenuEntry, MenuResult, TransientsResult, TransientWindow } from "./ports";
 import type { CaptureResult, ElementAtResult, FsPort, OcrResult, OcrWordsResult, RawWindow, ScreenPort, UiNode, UiReadResult, WindowsPort, WindowsSnapshot } from "./ports";
 
 const withTimeout = <T>(p: Promise<T>, ms: number, fallback: T): Promise<T> =>
@@ -413,7 +414,37 @@ export const nodeScreen: ScreenPort = {
     try {
       const r = await uiaHost.request<{ ok: boolean; chain?: Array<{ r: string; t: string; n: string; p: boolean }> }>(`at ${Math.round(x)} ${Math.round(y)}`, 3000);
       if (!r.ok || !r.chain) return { ok: false, reason: "nothing there" };
-      return { ok: true, chain: r.chain.map((c) => ({ rid: c.r, type: c.t, name: c.n, password: !!c.p })) };
+      return { ok: true, root: typeof (r as { w?: number }).w === "number" ? (r as { w?: number }).w : 0, chain: r.chain.map((c) => ({ rid: c.r, type: c.t, name: c.n, password: !!c.p })) };
+    } catch { return { ok: false, reason: "helper unavailable" }; }
+  },
+  /** the helper only: a one-shot script is far too slow for noticing a menu that is about to disappear */
+  async transients(owner = 0): Promise<TransientsResult> {
+    if (!Number.isSafeInteger(owner) || owner < 0) return { ok: false, reason: "invalid window" };
+    try {
+      const r = await uiaHost.request<{ ok: boolean; windows?: Array<{ hwnd: number; pid: number; proc: string; cls: string; kind: string; owner: number; rootOwner: number; top: boolean; tool: boolean; fg: boolean; l: number; t: number; w: number; h: number }> }>(`transients ${owner}`, 4000);
+      if (!r.ok || !r.windows) return { ok: false, reason: "could not list popups" };
+      const kinds = new Set(["menu", "dialog", "dropdown", "popup", "window", "secure", "other"]);
+      const windows: TransientWindow[] = r.windows.map((w) => ({ hwnd: w.hwnd, pid: w.pid, proc: String(w.proc ?? "").slice(0, 60), cls: String(w.cls ?? "").slice(0, 80), kind: (kinds.has(w.kind) ? w.kind : "other") as TransientWindow["kind"], owner: w.owner, rootOwner: w.rootOwner, top: !!w.top, tool: !!w.tool, fg: !!w.fg, rect: { l: w.l, t: w.t, w: w.w, h: w.h } }));
+      return { ok: true, windows };
+    } catch { return { ok: false, reason: "helper unavailable" }; }
+  },
+  async fieldValue(hwnd: number, rid: string): Promise<{ ok: true; value: string } | { ok: false; reason: string }> {
+    if (!validHwnd(hwnd) || !/^-?\d+(\.-?\d+)*$/.test(rid) || rid.length > 200) return { ok: false, reason: "invalid field" };
+    try {
+      const r = await uiaHost.request<{ ok: boolean; v?: string; error?: string }>(`fieldvalue ${hwnd} ${rid}`, 6000);
+      return r.ok ? { ok: true, value: String(r.v ?? "") } : { ok: false, reason: r.error === "password" ? "password field" : "not found" };
+    } catch { return { ok: false, reason: "helper unavailable" }; }
+  },
+  async readMenu(hwnd: number): Promise<MenuResult> {
+    if (!validHwnd(hwnd)) return { ok: false, reason: "invalid window" };
+    try {
+      const r = await uiaHost.request<{ ok: boolean; items?: Array<{ n: string; e: boolean; o: boolean; f: boolean; s: boolean; x: boolean; c: string; k: string; r: string; b: string; d: number; p: number }> }>(`menu ${hwnd}`, 6000);
+      if (!r.ok || !r.items) return { ok: false, reason: "could not read the menu" };
+      const items: MenuEntry[] = r.items.map((i) => {
+        const [l, t, w, h] = String(i.b || "").split(",").map(Number);
+        return { name: String(i.n ?? "").slice(0, 120), enabled: !!i.e, offscreen: !!i.o, focused: !!i.f, separator: !!i.s, expandable: !!i.x, checked: i.c === "on" ? "on" : i.c === "off" ? "off" : "", shortcut: String(i.k ?? "").slice(0, 40), rid: String(i.r ?? "").slice(0, 200), ...(Number.isFinite(w) && w > 0 ? { rect: { l, t, w, h } } : {}), depth: Math.max(0, i.d | 0), parent: i.p | 0 };
+      });
+      return { ok: true, items };
     } catch { return { ok: false, reason: "helper unavailable" }; }
   },
   async readUi(hwnd: number): Promise<UiReadResult> {

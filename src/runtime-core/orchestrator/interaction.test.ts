@@ -14,15 +14,16 @@ type Rect = { l: number; t: number; w: number; h: number };
 const item = (name: string, rid: string, rect: Rect, type = "ListItem"): UiNode => ({ type, name, enabled: true, offscreen: false, rid, rect });
 const explorer: RawWindow = { hwnd: 20, pid: 20, process: "explorer", title: "Documents - File Explorer", z: 0 };
 
-function world(opts: { ui: () => UiNode[]; pointer?: Partial<PointerPort> | null; words?: Array<{ text: string; rect: Rect }>; extraWindows?: RawWindow[]; windows?: () => RawWindow[] }) {
+function world(opts: { ui: (hwnd?: number) => UiNode[]; pointer?: Partial<PointerPort> | null; words?: Array<{ text: string; rect: Rect }>; extraWindows?: RawWindow[]; windows?: () => RawWindow[] }) {
   const calls: string[] = [];
+  const reads: number[] = [];
   const input: InputPort = {
     focusWindow: async (): Promise<ActResult> => ({ ok: true }), minimizeWindow: async () => ({ ok: true }), closeWindow: async () => ({ ok: true }),
     windowState: async (): Promise<WindowState> => ({ exists: true, minimized: false, pid: 20, foregroundPid: 20 }),
     invokeControl: async (): Promise<ActResult> => ({ ok: true }), setControlText: async () => ({ ok: true, readBack: "" }),
   };
   const screen: ScreenPort = {
-    readUi: async () => ({ ok: true, items: opts.ui().map((n) => ({ ...n })), truncated: false }),
+    readUi: async (hwnd) => { reads.push(hwnd); return { ok: true, items: opts.ui(hwnd).map((n) => ({ ...n })), truncated: false }; },
     ocr: async () => ({ ok: true, lines: ["x"] }),
     ocrWords: async () => ({ ok: true, words: opts.words ?? [] }),
   };
@@ -41,6 +42,7 @@ function world(opts: { ui: () => UiNode[]; pointer?: Partial<PointerPort> | null
   } as PointerPort;
   return {
     calls,
+    reads,
     deps: {
       fs, input, screen, launch, act: { openPath: async () => "" }, apps: { list: async () => [] },
       win: { query: async () => ({ processes: undefined, activePid: 20, activeHwnd: 20, windows: [{ hwnd: 999, pid: 999, process: "electron", title: "Momo", z: 5 } as RawWindow, explorer, ...(opts.windows ? opts.windows() : opts.extraWindows ?? [])] }) },
@@ -115,6 +117,21 @@ describe("right_click", () => {
     expect(w.calls).toContain("click:250,215:right");
     expect(lastTool(t.results)).toMatchObject({ outcome: "ok" });
     expect(lastTool(t.results)!.text).toMatch(/menu or something new appeared/);
+  });
+  it("reads only the menu window after a right-click, so confirming it does not re-read the whole app", async () => {
+    let clicked = false;
+    const file = item("Report.docx", "f1", { l: 100, t: 200, w: 300, h: 30 });
+    const menu = [item("Open", "m1", { l: 120, t: 240, w: 100, h: 24 }, "MenuItem"), item("Delete", "m2", { l: 120, t: 264, w: 100, h: 24 }, "MenuItem")];
+    const w = world({
+      ui: (hwnd) => (hwnd === 55 ? menu : [file]),
+      pointer: { click: async () => { clicked = true; return ok2; }, windowAt: () => (clicked ? 55 : 20) },
+    });
+    const t = run(w, [tool("right_click", { label: "Report.docx" }), done("ok")]);
+    await t.session.handleTranscript("s", "right click the report");
+    expect(lastTool(t.results)).toMatchObject({ outcome: "ok" });
+    expect(lastTool(t.results)!.text).toMatch(/menu appeared with 2 entries/);
+    expect(w.reads.filter((h) => h === 20)).toHaveLength(1); // the Explorer window was read once, before the click
+    expect(w.reads).toContain(55); // and the menu window was read on its own
   });
   it("asks which one when two items match, and never guesses", async () => {
     const w = world({ ui: () => [item("Report.docx", "a", { l: 100, t: 200, w: 300, h: 30 }), item("Report.docx", "b", { l: 100, t: 400, w: 300, h: 30 })] });

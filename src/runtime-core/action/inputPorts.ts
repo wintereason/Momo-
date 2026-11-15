@@ -177,7 +177,7 @@ const WINDOW_REASONS: Record<string, string> = {
   failed: "Windows wouldn't let me do that",
 };
 
-interface RawAct { ok: boolean; error?: string; changed?: boolean; value?: string; exists?: boolean; minimized?: boolean; pid?: number; fgPid?: number }
+interface RawAct { modal?: boolean; hung?: boolean; ok: boolean; error?: string; changed?: boolean; value?: string; exists?: boolean; minimized?: boolean; pid?: number; fgPid?: number }
 
 async function windowCall(mode: string, hwnd: number): Promise<RawAct> {
   return runPowerShell<RawAct>(WINDOW_SCRIPT, 15_000, JSON.stringify({ mode, hwnd }));
@@ -204,7 +204,7 @@ export const nodeInput: InputPort = {
       // the long-lived helper answers in milliseconds; the one-shot script (about a second) only when it is not available
       let r: RawAct;
       try { r = await uiaHost.request<RawAct>(`state ${hwnd}`, 4000); } catch { r = await windowCall("state", hwnd); }
-      return { exists: !!r.exists, minimized: !!r.minimized, pid: r.pid ?? 0, foregroundPid: r.fgPid && r.fgPid > 0 ? r.fgPid : null };
+      return { exists: !!r.exists, minimized: !!r.minimized, pid: r.pid ?? 0, foregroundPid: r.fgPid && r.fgPid > 0 ? r.fgPid : null, ...(typeof r.hung === "boolean" ? { hung: r.hung } : {}), ...(typeof r.modal === "boolean" ? { modal: r.modal } : {}) };
     } catch {
       return { exists: false, minimized: false, pid: 0, foregroundPid: null };
     }

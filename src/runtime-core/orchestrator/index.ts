@@ -7,3 +7,4 @@ export { buildAiConfig, type AiConfig } from "./ai/config";
 export { LlmClient, type UsageStore } from "./ai/llm";
 export { createAiService } from "./ai/service";
 export * from "./dictation";
+export * from "./recovery";

@@ -181,7 +181,8 @@ describe("how programs are started", () => {
   it("child processes are created in only a few places, and never through a shell", () => {
     const spawns = hits(/\b(spawn|execFile|execFileSync|exec|execSync|fork)\(/);
     // uiaHelper.ts: the long-lived local PowerShell host for UI Automation reads (fixed script file, no shell, no data in the command line)
-    expect(files(spawns)).toEqual(["src/runtime-core/apps/launchPorts.ts", "src/runtime-core/shared/nodePorts.ts", "src/runtime-core/shared/uiaHelper.ts"]);
+    // deadman.cjs: the tiny companion process that lets go of held input if this app is killed outright (same Electron binary, private IPC)
+    expect(files(spawns)).toEqual(["electron/deadman.cjs", "src/runtime-core/apps/launchPorts.ts", "src/runtime-core/shared/nodePorts.ts", "src/runtime-core/shared/uiaHelper.ts"]);
     expect(hits(/shell\s*:\s*true/)).toEqual([]);
     expect(hits(/\b(exec|execSync)\(/)).toEqual([]); // exec() goes through a shell
   });

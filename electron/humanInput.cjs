@@ -157,6 +157,15 @@ function createNative(koffi) {
 const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
 
 /**
+ * Is the window that is really there one of the windows that was expected? `expect` is one window or a FAMILY of windows (a popup menu, a dialog
+ * and the window that owns them are different top-level windows: a click inside a dialog is "in" the dialog, not in its owner).
+ */
+function rootOk(expect, actual) {
+  if (Array.isArray(expect)) return expect.length > 0 && actual !== 0 && expect.includes(actual);
+  return actual === expect;
+}
+
+/**
  * The logic: gliding, guarding, typing, the held-input ledger and the user-takeover watchdog. Tested with a fake `native`.
  * Optional `native` features (buttonDown, keyIsDown, foregroundRoot, monitorAt, cursorClipped, lastInputAgeMs) are used when present.
  * @param {ReturnType<typeof createNative>} native
@@ -178,6 +187,18 @@ function createPointerFrom(native, opts = {}) {
   let active = 0;          // operations in progress
   let timer = null;
   let lastInterrupt = null;
+  // ---------------------------------------------------------------- did anything REACH the app? ("no" | "maybe" | "yes", cumulative until resetActed())
+  // Only input that can act on the app counts: a button press, a key, a wheel notch, a typed character. Moving the pointer does not.
+  // "maybe" is set BEFORE the call (an error thrown after the input went through must not read as "nothing happened"), and put back if Windows refused it outright.
+  let actedLevel = "no";
+  const markActed = (lvl) => { if (lvl === "yes" || (lvl === "maybe" && actedLevel === "no")) actedLevel = lvl; };
+  function sending(fn) {
+    const before = actedLevel;
+    markActed("maybe");
+    const r = fn(); // a throw leaves it at "maybe" (or "yes" if it was already)
+    if (r === false) actedLevel = before; else markActed("yes");
+    return r;
+  }
   const samples = [];      // the last few pointer positions (coordinates only, in memory): to explain an interruption afterwards
   const sample = (s) => { samples.push({ t: Date.now(), ...s }); if (samples.length > 24) samples.shift(); };
 
@@ -194,6 +215,9 @@ function createPointerFrom(native, opts = {}) {
   const heldKeys = new Map();
   let watchdog = null;
   const heldCount = () => heldButtons.size + heldKeys.size;
+  const heldList = () => ({ buttons: [...heldButtons.keys()], keys: [...heldKeys.keys()] });
+  /** The app mirrors this to the dead-man companion (electron/deadman.cjs), so a killed process still lets go. Never throws. */
+  const notifyHeld = () => { try { if (opts.onHeld) opts.onHeld(heldList()); } catch { /* a mirror must never break input */ } };
   const beat = () => { const t = Date.now(); for (const e of heldButtons.values()) e.beat = t; for (const e of heldKeys.values()) e.beat = t; };
 
   function startWatchdog() {
@@ -223,7 +247,7 @@ function createPointerFrom(native, opts = {}) {
     heldButtons.set(k, { since: t, beat: t });
     startWatchdog();
     let sent = false, threw = false;
-    try { sent = native.mouseDown(right); } catch (e) { threw = true; throw e; } finally { if (!sent && !threw) heldButtons.delete(k); } // a refused press is not held; a THROWN one may have gone through, so it stays recorded and is released
+    try { sent = sending(() => native.mouseDown(right)); } catch (e) { threw = true; throw e; } finally { if (!sent && !threw) heldButtons.delete(k); notifyHeld(); } // a refused press is not held; a THROWN one may have gone through, so it stays recorded and is released
     own("button");
     return sent;
   }
@@ -233,6 +257,7 @@ function createPointerFrom(native, opts = {}) {
     own("button");
     try { native.mouseUp(right); } catch { const e = heldButtons.get(k); if (e) e.failed = true; return false; } // stays in the ledger: the watchdog and releaseAll try again
     heldButtons.delete(k);
+    notifyHeld();
     return true;
   }
   function pressKey(vk) {
@@ -241,8 +266,9 @@ function createPointerFrom(native, opts = {}) {
     const t = Date.now();
     heldKeys.set(vk, { since: t, beat: t });
     startWatchdog();
+    notifyHeld();
     let ok = false;
-    try { native.keyDown(vk); ok = true; } finally { if (!ok) { /* it may have gone through: keep it recorded so it is released */ } }
+    try { sending(() => native.keyDown(vk)); ok = true; } finally { if (!ok) { /* it may have gone through: keep it recorded so it is released */ } }
     own("key");
     return true;
   }
@@ -251,6 +277,7 @@ function createPointerFrom(native, opts = {}) {
     own("key");
     try { native.keyUp(vk); } catch { const e = heldKeys.get(vk); if (e) e.failed = true; return false; }
     heldKeys.delete(vk);
+    notifyHeld();
     return true;
   }
   /** Let go of everything Momo itself is holding (and nothing else). Safe to call any time, any number of times. Returns how many it released. */
@@ -352,7 +379,7 @@ function createPointerFrom(native, opts = {}) {
   }
   const windowResult = (p) => ({ ok: false, reason: p });
   const modifierHeld = () => !!native.keyIsDown && Date.now() >= ownUntil.key && MODIFIER_VKS.some((vk) => !heldKeys.has(vk) && native.keyIsDown(vk));
-  const wrongForeground = (o) => !!o && o.expectForeground && native.foregroundRoot && native.foregroundRoot() !== o.expectForeground;
+  const wrongForeground = (o) => !!o && !!o.expectForeground && !!native.foregroundRoot && !rootOk(o.expectForeground, native.foregroundRoot());
 
   /**
    * Last checks, right before a button goes down: the window under the pointer is still the right one, the target window has not moved or
@@ -361,7 +388,7 @@ function createPointerFrom(native, opts = {}) {
   async function beforePress(tx, ty, o) {
     const sync = () => {
       if (checkUser()) return stoppedResult();
-      if (o.expectRoot && native.windowAt(tx, ty) !== o.expectRoot) return { ok: false, reason: "covered" };
+      if (o.expectRoot && !rootOk(o.expectRoot, native.windowAt(tx, ty))) return { ok: false, reason: "covered" };
       if (o.expectClass && !o.expectClass.includes(native.classAt(tx, ty))) return { ok: false, reason: "covered" };
       const wp = windowProblem(o.expectWindow);
       if (wp) return windowResult(wp);
@@ -437,7 +464,7 @@ function createPointerFrom(native, opts = {}) {
       let bad = await glide(x, y, o.ms || 700, { watch: () => windowProblem(o.expectWindow) });
       if (bad) return bad;
       const tx = expected.x, ty = expected.y;
-      if (o.expectRoot && native.windowAt(tx, ty) !== o.expectRoot) return { ok: false, reason: "covered" }; // something else is in front there
+      if (o.expectRoot && !rootOk(o.expectRoot, native.windowAt(tx, ty))) return { ok: false, reason: "covered" }; // something else is in front there
       if (o.expectClass && !o.expectClass.includes(native.classAt(tx, ty))) return { ok: false, reason: "covered" }; // e.g. the taskbar is hidden behind a full-screen app
       if (checkUser()) return stoppedResult();
       const wp2 = windowProblem(o.expectWindow);
@@ -476,7 +503,9 @@ function createPointerFrom(native, opts = {}) {
   async function drag(a, b, o = {}) {
     return guarded(async () => {
       let hook = null;
-      const strategy = opts.dragCancel || "esc";
+      // Real Explorer test: Esc cancels the drag; returning to the origin and letting go there DROPPED the file into a folder the user had moved the pointer over.
+      // So Esc is always sent first; "esc+origin" only adds a return to the start for app-initiated stops.
+      const strategy = opts.dragCancel === "esc+origin" ? "esc+origin" : "esc";
       /** cancel an in-progress drag, then let go. `cause` "user": never move the pointer (it is theirs now). */
       const cancelDrag = (_why, cause) => {
         if (!heldButtons.has("left")) return; // already let go (the stop hook got there first): never send a second, stray Esc
@@ -545,16 +574,16 @@ function createPointerFrom(native, opts = {}) {
       if (wp) return windowResult(wp);
       const bad = await glide(x, y, o.ms || 600, { watch: () => windowProblem(o.expectWindow) });
       if (bad) return bad;
-      if (o.expectRoot && native.windowAt(expected.x, expected.y) !== o.expectRoot) return { ok: false, reason: "covered" };
+      if (o.expectRoot && !rootOk(o.expectRoot, native.windowAt(expected.x, expected.y))) return { ok: false, reason: "covered" };
       track({ x: expected.x, y: expected.y, phase: "hover" });
       const n = Math.max(1, Math.min(30, Math.abs(Math.round(notches))));
       for (let i = 0; i < n; i++) {
         if (checkUser()) return stoppedResult();
         const w2 = windowProblem(o.expectWindow);
         if (w2) return windowResult(w2);
-        if (o.expectRoot && native.windowAt(expected.x, expected.y) !== o.expectRoot) return { ok: false, reason: "covered" }; // something opened over it: stop, do not scroll that
+        if (o.expectRoot && !rootOk(o.expectRoot, native.windowAt(expected.x, expected.y))) return { ok: false, reason: "covered" }; // something opened over it: stop, do not scroll that
         own("wheel");
-        if (!native.wheel(notches > 0 ? -120 : 120)) return { ok: false, reason: "failed" };
+        if (!sending(() => native.wheel(notches > 0 ? -120 : 120))) return { ok: false, reason: "failed" };
         track({ x: Math.round(x), y: Math.round(y), phase: "scroll" });
         await wait(90);
       }
@@ -592,7 +621,7 @@ function createPointerFrom(native, opts = {}) {
         if (o.expectWindow && !native.windowRect(o.expectWindow)) return { ok: false, reason: "gone" }; // the window being typed into has closed
         own("key", 600);
         for (const unit of [...Buffer.from(ch, "utf16le").reduce((a, _, i, b) => (i % 2 ? a : [...a, b.readUInt16LE(i)]), [])]) {
-          if (!native.unit(unit)) return { ok: false, reason: "failed" };
+          if (!sending(() => native.unit(unit))) return { ok: false, reason: "failed" };
         }
         track({ phase: "key", ch }); // the letter appears in the ghost's bubble when it is really typed
         await wait(perKeyMs);
@@ -612,6 +641,10 @@ function createPointerFrom(native, opts = {}) {
     abort,
     /** let go of everything Momo is holding (idempotent). The app calls it when it exits. */
     releaseAll,
+    /** forget what was sent so far (a new step starts) */
+    resetActed() { actedLevel = "no"; },
+    /** the strongest answer since resetActed(): "no" nothing was sent, "maybe" something was being sent when it failed, "yes" input was delivered */
+    actedSince: () => actedLevel,
     /** how many buttons and keys Momo is holding right now (0 when nothing is) */
     heldCount,
     /** from the global input hook: "esc" | "key" | "wheel" | "click" (the user's, not Momo's) */

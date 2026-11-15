@@ -1,4 +1,7 @@
 import { z } from "zod";
+import type { Acted, Failure } from "./recovery/taxonomy";
+import { buildPopupTools } from "./popupTools";
+import type { Confirmation, ReadOnlyView, StepTarget } from "./recovery/verifyOnly";
 import { parseRuntimeEvent, type RuntimeEvent } from "../../types/runtime-events";
 import { classifyControlRisk, isProgramFile, type ActionAgent, type Policy, type Risk } from "../action";
 import { browserKeyFor, hintWords, matchProfileHint, profileLabels, siteUrl, type AppAgent } from "../apps";
@@ -69,8 +72,8 @@ export interface ToolCtx {
 }
 
 export type ToolOutcome =
-  | { ok: true; brief: string; report: string; verified: boolean; /** the evidence in a few words, shown by the shadow cursor once verified */ shown?: string }
-  | { ok: false; reason: string }
+  | { ok: true; brief: string; report: string; verified: boolean; /** the evidence in a few words, shown by the shadow cursor once verified */ shown?: string; /** how far the step got, when the tool knows better than the orchestrator can tell */ acted?: Acted; /** what it acted on (window numbers and a control id, never names or text): lets a read-only look re-check the effect */ target?: StepTarget }
+  | { ok: false; reason: string; /** the tool's own naming of the failure, when it has one (otherwise it is worked out from the reason) */ failure?: Partial<Failure> }
   /** several things match: the orchestrator asks the user (the planner never guesses), then re-runs with the patch */
   | { ok: false; ambiguous: { noun: string; labels: string[]; /** full paths (or other detail) shown under each label */ details?: string[]; patches: Record<string, unknown>[] } }
   /** the call turned out to need a decision: ask, then re-run with `confirmed` (and the lock) */
@@ -88,6 +91,11 @@ export interface ToolDef {
   describe(args: Record<string, unknown>, ctx: ToolCtx): Promise<string> | string;
   working(args: Record<string, unknown>): string;
   run(args: Record<string, unknown>, ctx: ToolCtx): Promise<ToolOutcome>;
+  /**
+   * Verify-only recovery: LOOK (read-only) and say whether this tool's effect is really there. Called only when a step may have run or could
+   * not be confirmed, never to repeat anything: it is handed a view that can only read. true = really there, false = really absent, null = cannot tell.
+   */
+  confirm?(args: Record<string, unknown>, target: StepTarget | undefined, view: ReadOnlyView): Promise<Confirmation>;
 }
 
 // ----------------------------------------------------------------------------------------------------- helpers
@@ -103,6 +111,8 @@ const norm = (s: string) => s.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").tri
 const sleeper = (ctx: ToolCtx) => ctx.d.sleep ?? ((ms: number) => new Promise<void>((res) => setTimeout(res, ms)));
 const attempts = (ctx: ToolCtx, mult = 1) => (ctx.d.verifyAttempts ?? 4) * mult;
 const fail = (reason: string): ToolOutcome => ({ ok: false, reason });
+/** a refusal that happens BEFORE anything is sent to the app (the window could not even be read): it says so, which is what makes a retry safe */
+const failBeforeActing = (reason: string, kind: Failure["kind"] = "uia_failed"): ToolOutcome => ({ ok: false, reason, failure: { kind, acted: "no" } });
 const ok = (brief: string, verified: boolean, report = brief, shown?: string): ToolOutcome => ({ ok: true, brief, report, verified, ...(shown ? { shown } : {}) });
 
 interface Win { hwnd: number; pid: number; title: string; process?: string }
@@ -153,10 +163,11 @@ async function windowFor(ctx: ToolCtx, a: { window?: string; _hwnd?: number }): 
   return resolveWindow(ctx, a.window, "window");
 }
 
-const typedOutcome = (readBack: string, text: string, name: string, ctx: ToolCtx): ToolOutcome =>
+const withTarget = (o: ToolOutcome, target: StepTarget): ToolOutcome => (o.ok ? { ...o, target } : o);
+const typedOutcome = (readBack: string, text: string, name: string, ctx: ToolCtx, target?: StepTarget): ToolOutcome =>
   ctx.d.verifier.typed(readBack, text).verified
-    ? ok(`Typed it into "${short(name, 50)}"; the field was read back and matches.`, true, undefined, "Typed, and read back")
-    : ok(`Entered it, but "${short(name, 50)}" now shows something different (${short(readBack, 40)}).`, false);
+    ? { ...ok(`Typed it into "${short(name, 50)}"; the field was read back and matches.`, true, undefined, "Typed, and read back"), ...(target ? { target } : {}) }
+    : { ...ok(`Entered it, but "${short(name, 50)}" now shows something different (${short(readBack, 40)}).`, false), ...(target ? { target } : {}) };
 
 const typeWord = (t: string): string =>
   ({ Button: "button", SplitButton: "button", CheckBox: "checkbox", RadioButton: "option", TabItem: "tab", Hyperlink: "link", MenuItem: "menu item", ListItem: "item", TreeItem: "item", DataItem: "item", Edit: "field", ComboBox: "field" } as Record<string, string>)[t] ?? "control";
@@ -413,6 +424,32 @@ async function untilChanged(ctx: ToolCtx, win: Win, before: UiNode[] | null | un
 }
 
 /**
+ * After a right-click the context menu is its own small top-level window right under the pointer (a few dozen controls), so it can be read
+ * on its own instead of re-reading the window it belongs to (Explorer or Chrome can hold thousands of controls, which is what made a
+ * right-click take about two seconds). Waits a moment for it: some apps open the menu a little late. Returns null when no such window
+ * appears (the app draws its menu inside its own window), and the caller falls back to looking at the whole window.
+ */
+async function popupWindow(ctx: ToolCtx, at: { x: number; y: number }, host: number, timeoutMs = 700): Promise<{ hwnd: number; items: UiNode[]; ok: boolean } | null> {
+  const p = humanPointer(ctx);
+  if (!p?.windowAt) return null;
+  const attempts = Math.max(1, Math.round(timeoutMs / 40));
+  let hwnd = 0;
+  for (let i = 0; i < attempts; i++) {
+    if (!ctx.live()) return null;
+    // the menu's top-left corner sits at the pointer, where the pixels may still be its transparent edge: sample a little inside too
+    for (const [dx, dy] of [[0, 0], [6, 6], [12, 12]] as const) {
+      const h = p.windowAt(Math.round(at.x) + dx, Math.round(at.y) + dy);
+      if (h && h !== host) { hwnd = h; break; }
+    }
+    if (hwnd) break;
+    await sleeper(ctx)(40);
+  }
+  if (!hwnd) return null;
+  const read = await ctx.d.uiAgent.read(hwnd);
+  return { hwnd, items: read.ok ? read.items : [], ok: read.ok };
+}
+
+/**
  * A real mouse action refused as "covered" (another window sits on that spot): raise the window once and try again, instead of giving up.
  * Every attempt is still guarded the same way (the window under the pointer must be the right one), so a retry can never click the wrong thing.
  */
@@ -593,6 +630,8 @@ interface ToolSpec<S extends z.ZodTypeAny> {
   describe(a: z.infer<S>, ctx: ToolCtx): Promise<string> | string;
   working(a: z.infer<S>): string;
   run(a: z.infer<S>, ctx: ToolCtx): Promise<ToolOutcome>;
+  /** read-only look at whether the effect is really there (see ToolDef.confirm) */
+  confirm?(a: z.infer<S>, target: StepTarget | undefined, view: ReadOnlyView): Promise<Confirmation>;
 }
 
 export function buildTools(): ToolDef[] {
@@ -765,7 +804,7 @@ export function buildTools(): ToolDef[] {
       const win = found.win;
       const ui = await ctx.d.uiAgent.read(win.hwnd);
       if (!ctx.live()) return fail("cancelled");
-      if (!ui.ok) return fail(`Could not look inside "${short(win.title)}" (${ui.reason}).`);
+      if (!ui.ok) return failBeforeActing(`Could not look inside "${short(win.title)}" (${ui.reason}).`);
       const comps = ctx.d.uiAgent.understandAll(win.hwnd, { process: win.process ?? "", title: win.title }, ui.items);
       if (comps.length === 0 && (await ctx.d.actionAgent.state(win.hwnd)).minimized) return fail(`"${short(win.title)}" is minimized, so none of its controls are on screen. Bring it to the front first (focus_window), then look again.`);
       // metadata was not enough for these: read their own pictures with the local OCR (nothing leaves this PC)
@@ -811,7 +850,7 @@ export function buildTools(): ToolDef[] {
       const win = found.win;
       const ui = await ctx.d.uiAgent.read(win.hwnd);
       if (!ctx.live()) return fail("cancelled");
-      if (!ui.ok) return fail(`Could not look inside "${short(win.title)}" (${ui.reason}).`);
+      if (!ui.ok) return failBeforeActing(`Could not look inside "${short(win.title)}" (${ui.reason}).`);
       let matches: UiNode[];
       if (a.ref) {
         const [rl, rt] = a.ref.split(",").map(Number);
@@ -946,9 +985,16 @@ export function buildTools(): ToolDef[] {
       }, { timeoutMs: (name === "close_window" ? 4 : 2) * (name === "close_window" ? 700 : 400), win: t.hwnd, pollMs: 120 });
       if (done.cancelled || !ctx.live()) return fail("cancelled");
       if (done.value) return ok(`${name === "focus_window" ? "Switched to" : name === "minimize_window" ? "Minimized" : "Closed"} "${title}"; Windows confirms it.`, true);
-      return ok(name === "focus_window" ? `Asked for "${title}" to come forward, but it did not (Windows sometimes blocks that).`
+      return withTarget(ok(name === "focus_window" ? `Asked for "${title}" to come forward, but it did not (Windows sometimes blocks that).`
         : name === "minimize_window" ? `Asked for "${title}" to be minimized, but it still is not.`
-        : `Asked "${title}" to close, but it is still open (it may be asking to save).`, false);
+        : `Asked "${title}" to close, but it is still open (it may be asking to save).`, false), { hwnd: t.hwnd, pid: t.pid });
+    },
+    // Look at the window again (read-only): ask Windows what is true now.
+    async confirm(_a, target, view) {
+      if (!target) return { verified: null, evidence: [] };
+      const s = await view.windowState(target.hwnd);
+      const v = name === "focus_window" ? view.verifier.windowFocused(s, target.pid) : name === "minimize_window" ? view.verifier.windowMinimized(s) : view.verifier.windowClosed(s);
+      return { verified: v.verified, evidence: [{ kind: "window_state", ok: v.verified }] };
     },
   });
   windowTool("focus_window"); windowTool("minimize_window"); windowTool("close_window");
@@ -971,7 +1017,7 @@ export function buildTools(): ToolDef[] {
       const wrect = humanPointer(ctx)?.windowRect?.(win.hwnd) ?? undefined; // where the window is NOW: it must still be there when the click lands
       const ui = await ctx.d.uiAgent.read(win.hwnd);
       if (!ctx.live()) return fail("cancelled");
-      if (!ui.ok) return fail(`Could not look inside "${short(win.title)}" (${ui.reason}).`);
+      if (!ui.ok) return failBeforeActing(`Could not look inside "${short(win.title)}" (${ui.reason}).`);
       let matches: UiNode[];
       if (a.ref) { // a control picked by where it is (one that has no label): the "l,t" that understand_screen showed
         const [rl, rt] = a.ref.split(",").map(Number);
@@ -1029,7 +1075,7 @@ export function buildTools(): ToolDef[] {
       await lookAround(ctx, win); if (!ctx.live()) return fail("cancelled");
       const ui = await ctx.d.uiAgent.read(win.hwnd);
       if (!ctx.live()) return fail("cancelled");
-      if (!ui.ok) return fail(`Could not look inside "${short(win.title)}" (${ui.reason}).`);
+      if (!ui.ok) return failBeforeActing(`Could not look inside "${short(win.title)}" (${ui.reason}).`);
       const matches = matchControls(ui.items, a.label, "type");
       if (matches.length === 0) { const names = visibleNames(ui.items, "type"); return fail(`No "${short(a.label, 40)}" field in "${short(win.title)}".${names.length ? ` Visible fields: ${names.join(", ")}.` : ""}`); }
       if (matches.length > 1) {
@@ -1065,7 +1111,7 @@ export function buildTools(): ToolDef[] {
             }, { timeoutMs: 1000, win: win.hwnd, pollMs: 100 });
             if (tw.cancelled || !ctx.live()) return fail("cancelled");
             const field = pickField(back);
-            if (field && !field.password && typeof field.value === "string" && ctx.d.verifier.typed(field.value, a.text).verified) return typedOutcome(field.value, a.text, node.name, ctx);
+            if (field && !field.password && typeof field.value === "string" && ctx.d.verifier.typed(field.value, a.text).verified) return typedOutcome(field.value, a.text, node.name, ctx, node.rid ? { hwnd: win.hwnd, pid: win.pid, rid: node.rid } : undefined);
           }
         }
       }
@@ -1073,7 +1119,17 @@ export function buildTools(): ToolDef[] {
       const r = await ctx.d.actionAgent.typeText({ hwnd: win.hwnd, pid: win.pid, rid: node.rid!, name: node.name }, a.text);
       if (!ctx.live()) return fail("cancelled");
       if (!r.ok) return fail(r.reason);
-      return typedOutcome(r.readBack, a.text, node.name, ctx);
+      return typedOutcome(r.readBack, a.text, node.name, ctx, node.rid ? { hwnd: win.hwnd, pid: win.pid, rid: node.rid } : undefined);
+    },
+    // Look at the field again (read-only): does it hold exactly what was typed? The value itself is never kept, only yes / no.
+    async confirm(a, target, view) {
+      if (!target?.rid) return { verified: null, evidence: [] };
+      const ui = await view.readWindow(target.hwnd);
+      if (!ui.ok) return { verified: null, evidence: [{ kind: "observation_failed", ok: null }] };
+      const field = ui.items.find((n) => n.rid === target.rid);
+      if (!field || field.password || typeof field.value !== "string") return { verified: null, evidence: [{ kind: "observation_failed", ok: null }] };
+      const same = view.verifier.typed(field.value, String(a.text)).verified;
+      return { verified: same, evidence: [{ kind: "field_matches", ok: same }] };
     },
   });
   // ---- Select a field by voice ("select the search bar"), then the user dictates into it, then says "search" / "okay".
@@ -1107,7 +1163,7 @@ export function buildTools(): ToolDef[] {
       await lookAround(ctx, win); if (!ctx.live()) return fail("cancelled");
       const ui = await ctx.d.uiAgent.read(win.hwnd);
       if (!ctx.live()) return fail("cancelled");
-      if (!ui.ok) return fail(`Could not look inside "${short(win.title)}" (${ui.reason}).`);
+      if (!ui.ok) return failBeforeActing(`Could not look inside "${short(win.title)}" (${ui.reason}).`);
       // only the boxes that are SHOWN: "the search bar" -> the words as said, then just the meaningful ones ("search")
       let matches = resolveField(ui.items, a as { label: string; _rid?: string; _box?: string });
       // "the search bar" names no particular box: EVERY box understood to be a search box counts, whatever it is called ("Search" would
@@ -1162,7 +1218,7 @@ export function buildTools(): ToolDef[] {
       const win = found.win;
       const ui = await ctx.d.uiAgent.read(win.hwnd);
       if (!ctx.live()) return fail("cancelled");
-      if (!ui.ok) return fail(`Could not look inside "${short(win.title)}" (${ui.reason}).`);
+      if (!ui.ok) return failBeforeActing(`Could not look inside "${short(win.title)}" (${ui.reason}).`);
       const node = ui.items.find((n) => n.focused && (n.type === "Edit" || n.type === "ComboBox") && !!n.rid);
       if (!node) return fail("No text field has the cursor. Ask the user to say “select the search bar” first, or to click into the field.");
       if (node.password) return fail("I never press Enter in password fields.");
@@ -1278,7 +1334,7 @@ export function buildTools(): ToolDef[] {
       const wrect = p.windowRect?.(win.hwnd) ?? undefined;
       const ui = await ctx.d.uiAgent.read(win.hwnd);
       if (!ctx.live()) return fail("cancelled");
-      if (!ui.ok) return fail(`Could not look inside "${short(win.title)}" (${ui.reason}).`);
+      if (!ui.ok) return failBeforeActing(`Could not look inside "${short(win.title)}" (${ui.reason}).`);
       const pick = pickControl(win, ui.items, String(a.label), { rid: a._rid as string | undefined, box: a._box as string | undefined }, { rid: "_rid", box: "_box" }, "control");
       if ("out" in pick) return pick.out;
       const node = pick.node;
@@ -1292,6 +1348,13 @@ export function buildTools(): ToolDef[] {
       const bad = mapStop(res);
       if (bad) return bad;
       ctx.d.emit({ type: "cursor.result", state: "verifying", text: "Checking…" });
+      // Read only the menu window when there is one: a right-click should not cost two seconds.
+      const pop = await popupWindow(ctx, at, win.hwnd);
+      if (pop) {
+        if (!ctx.live()) return fail("cancelled");
+        const entries = new Set(pop.items.filter((n) => !n.offscreen && n.name.trim()).map((n) => norm(n.name))).size;
+        return ok(`Right-clicked "${short(node.name, 50)}"; a menu appeared${entries ? ` with ${entries} ${entries === 1 ? "entry" : "entries"}` : ""}. Look at the screen to read its entries.`, true, undefined, "A menu opened");
+      }
       const seen = await untilChanged(ctx, win, ui.items, 1500, screenPrint, wins0);
       if (seen.cancelled || !ctx.live()) return fail("cancelled");
       const after = seen.after, wins1 = seen.wins1;
@@ -1328,11 +1391,11 @@ export function buildTools(): ToolDef[] {
       const wrect = p.windowRect?.(win.hwnd) ?? undefined;
       const ui = await ctx.d.uiAgent.read(win.hwnd);
       if (!ctx.live()) return fail("cancelled");
-      if (!ui.ok) return fail(`Could not look inside "${short(win.title)}" (${ui.reason}).`);
+      if (!ui.ok) return failBeforeActing(`Could not look inside "${short(win.title)}" (${ui.reason}).`);
       const src = pickControl(win, ui.items, String(a.from), { rid: a._fr as string | undefined, box: a._fb as string | undefined }, { rid: "_fr", box: "_fb" }, "item");
       if ("out" in src) return src.out;
       let tui: Awaited<ReturnType<typeof ctx.d.uiAgent.read>> = ui;
-      if (twin.hwnd !== win.hwnd) { tui = await ctx.d.uiAgent.read(twin.hwnd); if (!ctx.live()) return fail("cancelled"); if (!tui.ok) return fail(`Could not look inside "${short(twin.title)}" (${tui.reason}).`); }
+      if (twin.hwnd !== win.hwnd) { tui = await ctx.d.uiAgent.read(twin.hwnd); if (!ctx.live()) return fail("cancelled"); if (!tui.ok) return failBeforeActing(`Could not look inside "${short(twin.title)}" (${tui.reason}).`); }
       const dst = pickControl(twin, tui.items, String(a.to), { rid: a._tr as string | undefined, box: a._tb as string | undefined }, { rid: "_tr", box: "_tb" }, "drop target");
       if ("out" in dst) return dst.out;
       if (twin.hwnd === win.hwnd && boxKey(src.node) === boxKey(dst.node)) return fail("The item and the place to drop it are the same thing.");
@@ -1422,7 +1485,7 @@ export function buildTools(): ToolDef[] {
       await lookAround(ctx, win); if (!ctx.live()) return fail("cancelled");
       const ui = await ctx.d.uiAgent.read(win.hwnd);
       if (!ctx.live()) return fail("cancelled");
-      if (!ui.ok) return fail(`Could not look inside "${short(win.title)}" (${ui.reason}).`);
+      if (!ui.ok) return failBeforeActing(`Could not look inside "${short(win.title)}" (${ui.reason}).`);
       const pick = pickControl(win, ui.items, String(a.label), { rid: a._rid as string | undefined, box: a._box as string | undefined }, { rid: "_rid", box: "_box" }, "field");
       if ("out" in pick) return pick.out;
       if (pick.node.password) return fail("I never select text in password fields.");
@@ -1774,6 +1837,8 @@ export function buildTools(): ToolDef[] {
   });
 
   void hintWords;
+  // menus, dialogs, drop-downs and other transient windows (phase 5): new tools in their own file
+  tools.push(...buildPopupTools());
   return tools;
 }
 

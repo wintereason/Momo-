@@ -8,7 +8,7 @@ $script:n = 0
 $xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Momo Test Window" Width="440" Height="420" WindowStartupLocation="CenterScreen">
+        Title="Momo Test Window" Width="440" Height="500" WindowStartupLocation="CenterScreen">
   <StackPanel Margin="20">
     <TextBlock x:Name="Status" Text="Ready" Margin="0,0,0,10"/>
     <StackPanel Orientation="Horizontal">
@@ -18,6 +18,11 @@ $xaml = @'
     <Button x:Name="B3" Content="Locked" IsEnabled="False" Width="150" HorizontalAlignment="Left" Margin="0,0,0,10"/>
     <TextBox x:Name="Search" AutomationProperties.Name="Search box" Width="300" HorizontalAlignment="Left" Margin="0,0,0,10"/>
     <CheckBox x:Name="Cb" Content="Enable thing" Margin="0,0,0,10"/>
+    <ListBox x:Name="Files" AutomationProperties.Name="Files" Height="96" Width="300" HorizontalAlignment="Left" Margin="0,0,0,10">
+      <ListBoxItem>Report.docx</ListBoxItem>
+      <ListBoxItem>Notes.txt</ListBoxItem>
+      <ListBoxItem>Budget.xlsx</ListBoxItem>
+    </ListBox>
     <PasswordBox x:Name="Pw" AutomationProperties.Name="Password" Password="hunter2" Width="300" HorizontalAlignment="Left"/>
   </StackPanel>
 </Window>
@@ -27,6 +32,16 @@ $win = [Windows.Markup.XamlReader]::Parse($xaml)
 $status = $win.FindName('Status')
 $win.FindName('B1').Add_Click({ $script:n++; $status.Text = "Clicked $($script:n) times" })
 $win.FindName('B2').Add_Click({ $status.Text = 'DELETE CLICKED' })
+
+# A real context menu on the list (its own popup window, like Explorer's): used to test right-click for real.
+$menu = New-Object System.Windows.Controls.ContextMenu
+foreach ($entry in @('Open', 'Open with', 'Rename', 'Delete')) {
+  $mi = New-Object System.Windows.Controls.MenuItem
+  $mi.Header = $entry
+  $mi.Add_Click({ param($sender, $e) $status.Text = "Menu: $($sender.Header)" }.GetNewClosure())
+  [void]$menu.Items.Add($mi)
+}
+$win.FindName('Files').ContextMenu = $menu
 
 $timer = New-Object System.Windows.Threading.DispatcherTimer
 $timer.Interval = [TimeSpan]::FromSeconds($Seconds)

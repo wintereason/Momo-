@@ -75,7 +75,6 @@ public static class MomoHost {
   [DllImport("user32.dll")] static extern bool IsZoomed(IntPtr h);
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
   [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
-  [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint cmd);
   [DllImport("user32.dll", EntryPoint = "GetWindowLongW")] static extern int GetWindowLong(IntPtr h, int i);
   [DllImport("dwmapi.dll")] static extern int DwmGetWindowAttribute(IntPtr h, int a, out int v, int sz);
   [DllImport("user32.dll")] static extern IntPtr GetForegroundWindow();
@@ -83,6 +82,8 @@ public static class MomoHost {
   [DllImport("user32.dll", EntryPoint = "SendMessageTimeoutW")] static extern IntPtr SendMessageTimeout(IntPtr h, int msg, IntPtr w, IntPtr l, int flags, int timeout, out IntPtr result);
 
   [DllImport("user32.dll")] static extern bool IsWindow(IntPtr h);
+  [DllImport("user32.dll")] static extern bool IsHungAppWindow(IntPtr h);
+  [DllImport("user32.dll")] static extern IntPtr GetWindow(IntPtr h, uint cmd);
 
   // read-only window facts (the same four the one-shot script reported): does it exist, is it minimized, whose is it, who is in front
   public static string State(long hwnd) {
@@ -91,7 +92,7 @@ public static class MomoHost {
     uint pid = 0, fgPid = 0;
     if (ex) GetWindowThreadProcessId(h, out pid);
     GetWindowThreadProcessId(GetForegroundWindow(), out fgPid);
-    return "{\"ok\":true,\"exists\":" + B(ex) + ",\"minimized\":" + B(ex && IsIconic(h)) + ",\"pid\":" + pid + ",\"fgPid\":" + fgPid + "}";
+    return "{\"ok\":true,\"exists\":" + B(ex) + ",\"minimized\":" + B(ex && IsIconic(h)) + ",\"pid\":" + pid + ",\"fgPid\":" + fgPid + ",\"hung\":" + B(ex && IsHungAppWindow(h)) + ",\"modal\":" + B(ex && !IsIconic(h) && GetWindow(h, 6) != IntPtr.Zero && GetWindow(h, 6) != h) + "}";
   }
 
   [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr c);
@@ -105,7 +106,8 @@ public static class MomoHost {
     try {
       AutomationElement el = AutomationElement.FromPoint(new System.Windows.Point(x, y));
       var walker = TreeWalker.ControlViewWalker;
-      sb.Append("{\"ok\":true,\"chain\":[");
+      PT pt; pt.x = x; pt.y = y; IntPtr rootH = GetAncestor(WindowFromPoint(pt), 2);
+      sb.Append("{\"ok\":true,\"w\":").Append(rootH.ToInt64()).Append(",\"chain\":[");
       int n = 0; bool first = true;
       while (el != null && n < 7) {
         string rid = ""; try { rid = string.Join(".", Array.ConvertAll(el.GetRuntimeId(), v => v.ToString())); } catch { }
@@ -122,6 +124,180 @@ public static class MomoHost {
       sb.Append("]}");
     } catch { return "{\"ok\":false,\"error\":\"at_failed\"}"; }
     return sb.ToString();
+  }
+
+  // A DPI-UNAWARE application (an old WinForms/MFC program) is drawn scaled up by Windows, and UI Automation reports ITS controls in the app's own
+  // unscaled coordinates (half of the real pixels at 200%). The pointer works in real screen pixels, so those rectangles are mapped back:
+  // the window's real rectangle (GetWindowRect, always real pixels here) against the same window as UI Automation reports it gives the scale.
+  // For a DPI-aware window the two agree, the scale is 1 and nothing changes.
+  class DpiMap {
+    [DllImport("user32.dll")] static extern uint GetDpiForWindow(IntPtr h);
+    [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr h, uint f);
+    [DllImport("shcore.dll")] static extern int GetDpiForMonitor(IntPtr m, int type, out uint x, out uint y);
+    /// A window's own DPI (96 for an unaware app) against the real DPI of its screen: a candidate scale, or 1 when they agree.
+    public static double Candidate(long hwnd) {
+      try {
+        IntPtr h = new IntPtr(hwnd);
+        uint wd = GetDpiForWindow(h); if (wd == 0) return 1;
+        uint mx, my; if (GetDpiForMonitor(MonitorFromWindow(h, 2), 0, out mx, out my) != 0 || mx == 0) return 1;
+        return mx > wd * 1.1 ? (double)mx / wd : 1;
+      } catch { return 1; }
+    }
+    static bool Inside(int l, int t, int w, int h, RECTI r) { return w > 0 && h > 0 && l >= r.l - 8 && t >= r.t - 8 && l + w <= r.r + 8 && t + h <= r.b + 8; }
+    /// Which coordinates is this provider using? Not every provider of an unaware app reports the app's unscaled pixels (system dialogs report real
+    /// ones). So it is DECIDED from the controls themselves: the interpretation under which they lie inside the window's real rectangle wins.
+    /// rects = l,t,w,h per control. Returns the scale to apply (1 = they already are real pixels).
+    public static double Decide(long hwnd, List<int[]> rects) {
+      double c = Candidate(hwnd); if (c <= 1) return 1;
+      RECTI R; if (!GetWindowRect(new IntPtr(hwnd), out R)) return 1;
+      int raw = 0, scaled = 0;
+      foreach (var q in rects) {
+        if (Inside(q[0], q[1], q[2], q[3], R)) raw++;
+        if (Inside((int)Math.Round(q[0] * c), (int)Math.Round(q[1] * c), (int)Math.Round(q[2] * c), (int)Math.Round(q[3] * c), R)) scaled++;
+      }
+      return scaled > raw ? c : 1;
+    }
+  }
+
+  // ---------------------------------------------------------------- transient windows (menus, dialogs, dropdowns, popups)
+  // The normal window list skips everything that is owned, untitled or a tool window: exactly what menus, dialogs, dropdowns and toasts are.
+  // This lists those (visible ones only) with facts about them: handle, process, class, owner chain, size. NEVER titles or text.
+  [StructLayout(LayoutKind.Sequential)] struct RECTI { public int l, t, r, b; }
+  [DllImport("user32.dll")] static extern bool GetWindowRect(IntPtr h, out RECTI r);
+  [DllImport("user32.dll")] static extern IntPtr GetAncestor(IntPtr h, uint f);
+  [StructLayout(LayoutKind.Sequential)] struct PT { public int x, y; }
+  [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(PT p);
+  static readonly HashSet<string> NoiseClasses = new HashSet<string> { "SysShadow", "tooltips_class32", "Auto-Suggest Dropdown", "IME", "MSCTFIME UI", "GDI+ Hook Window Class", "Shell_TrayWnd", "Shell_SecondaryTrayWnd", "Progman", "WorkerW", "_SearchEditBoxFakeWindow", "NotifyIconOverflowWindow" };
+  static readonly HashSet<string> SecureProcesses = new HashSet<string> { "consent", "credentialuibroker", "logonui", "winlogon", "securityhealthsystray" };
+
+  static string TKind(string cls, bool titled, bool owned, string proc) {
+    string pl = (proc ?? "").ToLowerInvariant();
+    if (SecureProcesses.Contains(pl) || cls.IndexOf("Credential", StringComparison.OrdinalIgnoreCase) >= 0) return "secure";
+    if (cls == "#32768") return "menu";
+    if (cls == "#32770") return "dialog";
+    if (cls == "ComboLBox" || cls == "ComboBox" || cls.IndexOf("DropDown", StringComparison.OrdinalIgnoreCase) >= 0) return "dropdown";
+    if (cls.StartsWith("Xaml_WindowedPopupClass") || cls.StartsWith("Microsoft.UI.Content.PopupWindowSiteBridge") || cls.StartsWith("SunAwtWindow") || cls.StartsWith("QWindowPopup") || cls.StartsWith("QWindowToolSaveBits") || cls.StartsWith("MozillaDropShadowWindowClass")) return "popup";
+    if (!titled && (cls.StartsWith("WindowsForms10.Window") || cls.StartsWith("Chrome_WidgetWin") || cls.StartsWith("HwndWrapper") || cls.StartsWith("Qt") )) return "popup";
+    if (titled && owned) return "window";
+    return "other";
+  }
+
+  /// ownerFilter 0 = every transient window; otherwise only those that belong to that window (its owner chain, or the same process when they have no owner).
+  public static string Transients(long ownerFilter) {
+    IntPtr fgRoot = GetAncestor(GetForegroundWindow(), 2);
+    uint ownerPid = 0; if (ownerFilter != 0) GetWindowThreadProcessId(new IntPtr(ownerFilter), out ownerPid);
+    var procNames = new Dictionary<uint, string>();
+    var sb = new StringBuilder(); sb.Append("{\"ok\":true,\"windows\":["); bool first = true; int n = 0;
+    EnumWindows(delegate (IntPtr h, IntPtr l) {
+      if (n >= 40) return false;
+      if (!IsWindowVisible(h)) return true;
+      var k = new StringBuilder(128); GetClassName(h, k, 128); string cls = k.ToString();
+      if (NoiseClasses.Contains(cls) || cls.StartsWith(".NET-Broadcast")) return true;
+      IntPtr owner = GetWindow(h, 4);
+      int ex = GetWindowLong(h, -20);
+      bool toolWin = (ex & 0x80) != 0 && (ex & 0x40000) == 0;
+      var t = new StringBuilder(8); int tl = GetWindowText(h, t, 8); bool titled = tl > 0;
+      int cloaked = 0; if (!IsIconic(h)) DwmGetWindowAttribute(h, 14, out cloaked, 4);
+      if (cloaked != 0) return true;
+      bool listed = owner == IntPtr.Zero && titled && !toolWin; // what the normal window list shows
+      if (listed && cls != "#32770" && cls != "#32768") return true;
+      uint pid; GetWindowThreadProcessId(h, out pid);
+      IntPtr rootOwner = GetAncestor(h, 3);
+      if (ownerFilter != 0 && !(rootOwner.ToInt64() == ownerFilter || owner.ToInt64() == ownerFilter || (owner == IntPtr.Zero && pid == ownerPid && h.ToInt64() != ownerFilter))) return true;
+      string pn; if (!procNames.TryGetValue(pid, out pn)) { try { var pr = Process.GetProcessById((int)pid); pn = pr.ProcessName; pr.Dispose(); } catch { pn = ""; } procNames[pid] = pn; }
+      string kind = TKind(cls, titled, owner != IntPtr.Zero, pn);
+      if (kind == "other" && !(toolWin || owner != IntPtr.Zero)) return true; // an ordinary window the normal list already handles
+      RECTI r; GetWindowRect(h, out r);
+      if (r.r - r.l <= 1 || r.b - r.t <= 1) return true;          // no size: a host window, not something anyone can see
+      if (kind == "other" && (ex & 8) == 0) return true;           // an unknown window that is not on top of everything is not a popup
+      if (!first) sb.Append(','); first = false; n++;
+      sb.Append("{\"hwnd\":").Append(h.ToInt64()).Append(",\"pid\":").Append(pid).Append(",\"proc\":"); Q(sb, pn);
+      sb.Append(",\"cls\":"); Q(sb, cls); sb.Append(",\"kind\":"); Q(sb, kind);
+      sb.Append(",\"owner\":").Append(owner.ToInt64()).Append(",\"rootOwner\":").Append(rootOwner.ToInt64());
+      sb.Append(",\"top\":").Append(B((ex & 8) != 0)).Append(",\"tool\":").Append(B(toolWin)).Append(",\"fg\":").Append(B(h == fgRoot));
+      sb.Append(",\"l\":").Append(r.l).Append(",\"t\":").Append(r.t).Append(",\"w\":").Append(r.r - r.l).Append(",\"h\":").Append(r.b - r.t).Append('}');
+      return true;
+    }, IntPtr.Zero);
+    sb.Append("]}");
+    return sb.ToString();
+  }
+
+  // The menu inside one popup window: its items with their hierarchy (depth, parent), state and the item that has the keyboard focus.
+  // Names are returned to the caller (they are what the user sees); nothing is stored here.
+  public static string Menu(long hwnd) {
+    var sw = Stopwatch.StartNew();
+    var sb = new StringBuilder();
+    try {
+      AutomationElement root = AutomationElement.FromHandle(new IntPtr(hwnd));
+      var walker = TreeWalker.ControlViewWalker;
+      var rows = new List<string[]>(); var rects = new List<int[]>(); var rowRects = new List<int[]>();
+      int count = 0;
+      Action<AutomationElement, int, int> walk = null;
+      walk = delegate (AutomationElement el, int depth, int parent) {
+        if (depth > 4 || count >= 120 || sw.ElapsedMilliseconds > 1500) return;
+        AutomationElement c = null; try { c = walker.GetFirstChild(el); } catch { }
+        while (c != null && count < 120 && sw.ElapsedMilliseconds <= 1500) {
+          string type = ""; try { var ct = c.Current.ControlType; if (ct != null) type = ct.ProgrammaticName ?? ""; } catch { }
+          if (type.StartsWith("ControlType.")) type = type.Substring(12);
+          int me = parent;
+          if (type == "MenuItem" || type == "Separator") {
+            string nm = ""; try { nm = c.Current.Name ?? ""; } catch { }
+            bool en = true; try { en = c.Current.IsEnabled; } catch { }
+            bool off = false; try { off = c.Current.IsOffscreen; } catch { }
+            bool foc = false; try { foc = c.Current.HasKeyboardFocus; } catch { }
+            string key = ""; try { key = c.Current.AcceleratorKey ?? ""; } catch { }
+            string rid = ""; try { rid = string.Join(".", Array.ConvertAll(c.GetRuntimeId(), v => v.ToString())); } catch { }
+            string chk = ""; bool exp = false; object pat;
+            try { if (c.TryGetCurrentPattern(TogglePattern.Pattern, out pat)) chk = ((TogglePattern)pat).Current.ToggleState == ToggleState.On ? "on" : "off"; } catch { }
+            try { if (chk == "" && c.TryGetCurrentPattern(SelectionItemPattern.Pattern, out pat)) chk = ((SelectionItemPattern)pat).Current.IsSelected ? "on" : "off"; } catch { }
+            try { exp = c.TryGetCurrentPattern(ExpandCollapsePattern.Pattern, out pat); } catch { }
+            int[] rc = null; try { var b = c.Current.BoundingRectangle; if (!b.IsEmpty && !double.IsInfinity(b.Width)) { rc = new int[] { (int)b.Left, (int)b.Top, (int)b.Width, (int)b.Height }; rects.Add(rc); } } catch { }
+            me = count++;
+            rows.Add(new string[] { nm, B(en), B(off), B(foc), B(type == "Separator"), B(exp), chk, key, rid, depth.ToString(), parent.ToString() });
+            rowRects.Add(rc);
+          }
+          walk(c, type == "MenuItem" ? depth + 1 : depth, me);
+          try { c = walker.GetNextSibling(c); } catch { c = null; }
+        }
+      };
+      walk(root, 0, -1);
+      double sc = DpiMap.Decide(hwnd, rects);
+      sb.Append("{\"ok\":true,\"scale\":").Append(sc.ToString("0.###", System.Globalization.CultureInfo.InvariantCulture)).Append(",\"items\":[");
+      for (int i = 0; i < rows.Count; i++) {
+        var r = rows[i]; var rc = rowRects[i];
+        string bl = rc == null ? "" : ((int)Math.Round(rc[0] * sc)) + "," + ((int)Math.Round(rc[1] * sc)) + "," + ((int)Math.Round(rc[2] * sc)) + "," + ((int)Math.Round(rc[3] * sc));
+        if (i > 0) sb.Append(',');
+        sb.Append("{\"n\":"); Q(sb, r[0]); sb.Append(",\"e\":").Append(r[1]).Append(",\"o\":").Append(r[2]).Append(",\"f\":").Append(r[3]);
+        sb.Append(",\"s\":").Append(r[4]).Append(",\"x\":").Append(r[5]).Append(",\"c\":"); Q(sb, r[6]);
+        sb.Append(",\"k\":"); Q(sb, r[7]); sb.Append(",\"r\":"); Q(sb, r[8]); sb.Append(",\"b\":"); Q(sb, bl);
+        sb.Append(",\"d\":").Append(r[9]).Append(",\"p\":").Append(r[10]).Append('}');
+      }
+      sb.Append("]}");
+    } catch { return "{\"ok\":false,\"error\":\"menu_failed\"}"; }
+    return sb.ToString();
+  }
+
+  // The current value of ONE field, found by walking the window (a runtime-id lookup is not reliable in every provider). Used only to check what was typed
+  // into a field; the value goes back to the caller and is never kept here. A password field is refused.
+  public static string FieldValue(long hwnd, string rid) {
+    try {
+      var root = AutomationElement.FromHandle(new IntPtr(hwnd));
+      var walker = TreeWalker.RawViewWalker; var sw = Stopwatch.StartNew();
+      var stack = new Stack<AutomationElement>(); stack.Push(root); int n = 0;
+      while (stack.Count > 0 && n < 5000 && sw.ElapsedMilliseconds < 3000) {
+        var el = stack.Pop(); n++;
+        string r = ""; try { r = string.Join(".", Array.ConvertAll(el.GetRuntimeId(), v => v.ToString())); } catch { }
+        if (r == rid) {
+          bool pw = false; try { pw = el.Current.IsPassword; } catch { }
+          if (pw) return "{\"ok\":false,\"error\":\"password\"}";
+          object pat; string v = ""; try { if (el.TryGetCurrentPattern(ValuePattern.Pattern, out pat)) v = ((ValuePattern)pat).Current.Value ?? ""; } catch { }
+          var sb = new StringBuilder(); sb.Append("{\"ok\":true,\"v\":"); Q(sb, v); sb.Append('}'); return sb.ToString();
+        }
+        AutomationElement c = null; try { c = walker.GetFirstChild(el); } catch { }
+        while (c != null) { stack.Push(c); try { c = walker.GetNextSibling(c); } catch { c = null; } }
+      }
+    } catch { }
+    return "{\"ok\":false,\"error\":\"not_found\"}";
   }
 
   public static string Windows() {
@@ -302,6 +478,11 @@ public static class MomoHost {
       } catch (Exception ex) { var st = ex.StackTrace ?? ""; int ni = st.IndexOf("ReadTree"); LastErr = ex.GetType().Name + ": " + ex.Message + " | " + st.Substring(0, Math.Min(st.Length, 160)); NErr++; }
     }
     truncated = stack.Count > 0;
+    // report REAL screen pixels: for an unaware app whose provider reports unscaled ones, scale them (decided from the controls themselves)
+    var rects = new List<int[]>();
+    foreach (var it in items) { var p = it.b.Split(','); int l, t, w, h; if (p.Length == 4 && int.TryParse(p[0], out l) && int.TryParse(p[1], out t) && int.TryParse(p[2], out w) && int.TryParse(p[3], out h) && w > 0 && h > 0) rects.Add(new int[] { l, t, w, h }); }
+    double sc = rects.Count > 0 ? DpiMap.Decide(hwnd, rects) : 1;
+    if (sc > 1) foreach (var it in items) { var p = it.b.Split(','); int l, t, w, h; if (p.Length == 4 && int.TryParse(p[0], out l) && int.TryParse(p[1], out t) && int.TryParse(p[2], out w) && int.TryParse(p[3], out h)) it.b = ((int)Math.Round(l * sc)) + "," + ((int)Math.Round(t * sc)) + "," + ((int)Math.Round(w * sc)) + "," + ((int)Math.Round(h * sc)); }
     return items;
   }
 
@@ -469,6 +650,9 @@ while ($true) {
   $id = $p[0]
   try {
     if ($p[1] -eq 'uia') { $out = [MomoHost]::Read([long]$p[2]) }
+    elseif ($p[1] -eq 'transients') { $out = [MomoHost]::Transients([long]$p[2]) }
+    elseif ($p[1] -eq 'fieldvalue') { $out = [MomoHost]::FieldValue([long]$p[2], [string]$p[3]) }
+    elseif ($p[1] -eq 'menu') { $out = [MomoHost]::Menu([long]$p[2]) }
     elseif ($p[1] -eq 'at') { $out = [MomoHost]::At([int]$p[2], [int]$p[3]) }
     elseif ($p[1] -eq 'state') { $out = [MomoHost]::State([long]$p[2]) }
     elseif ($p[1] -eq 'windows') { $out = [MomoHost]::Windows() }

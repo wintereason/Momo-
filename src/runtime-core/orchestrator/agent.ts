@@ -3,11 +3,43 @@ import { decide, resolveYesNo, type Risk } from "../action";
 import { resolveChoice } from "./choice";
 import { TOOL_CATALOG, buildTools, type AgentDeps, type ToolDef, type ToolOutcome } from "./tools";
 import type { PlanStep } from "./ai/prompts";
+import { describeFailure, isTerminal, maxActed, type Acted, type Evidence, type Failure } from "./recovery/taxonomy";
+import { decideRetry, refreshArgs } from "./recovery/policy";
+import { waitResponsive } from "./recovery/hung";
+import { ActionJournal, type JournalEntry } from "./recovery/journal";
+import { verifyOnly, type ReadOnlyView, type StepTarget } from "./recovery/verifyOnly";
 
 export type { AgentDeps };
 export type OrchestratorDeps = AgentDeps;
 
 const WITHHELD = "[Private result: not shown to the AI. It will be shown to the user exactly as read. If that completes the goal, finish with done.]";
+
+/** What one try of a step left behind (see Orchestrator.executeOnce). */
+interface Attempt {
+  /** the task was cancelled or the user took over: nothing more is done */
+  stop?: boolean;
+  out: ToolOutcome;
+  threw: boolean;
+  delivered?: Acted;
+  failure?: Failure;
+  verdict?: "verified" | "absent" | "unconfirmed";
+  facts: Evidence;
+  seq: number;
+  base: Risk;
+  isAction: boolean;
+}
+
+/** Say what the look found when it explains the missing result: a frozen window, or a dialog waiting for an answer. Facts only; nothing is clicked. */
+function annotate(out: ToolOutcome, f: Evidence): ToolOutcome {
+  const notes: string[] = [];
+  if (f.windowHung === true) notes.push("The window is not responding right now, so I sent it nothing more.");
+  if (f.windowBlockedByDialog === true || f.newWindowAppeared === true) notes.push("A dialog or new window appeared and may be waiting for an answer; I did not click anything in it. Look at the screen.");
+  if (notes.length === 0) return out;
+  const add = " " + notes.join(" ");
+  if (out.ok) return { ...out, brief: out.brief + add, report: out.report + add };
+  if ("reason" in out) return { ...out, reason: out.reason + add };
+  return out;
+}
 
 /** One tool call, ready to run. `confirmed` means the user already approved exactly this call. */
 interface Call { tool: ToolDef; args: Record<string, unknown>; confirmed: boolean; lock?: string }
@@ -30,6 +62,11 @@ interface Task {
   epoch: number;
   seen: Map<string, number>;
   repeats: number;
+  /** what was done in this task and how far each step got (bounded, in memory, no content): see recovery/journal.ts */
+  journal: ActionJournal;
+  /** automatic retries used in this task (shared by every tool), and per call */
+  retries: number;
+  retried: Map<string, number>;
 }
 
 type Pending =
@@ -54,6 +91,10 @@ export class Orchestrator {
   private busy = false;
   private lastTaskId: string | null = null;
   private abandoned = new Set<string>();
+  /** the journal of the most recent task (memory only; replaced by the next task's) */
+  private lastJournal: ActionJournal | null = null;
+  /** a copy of the most recent task's action journal: what ran, how far it got, what looking afterwards found. Holds no content. */
+  journal(): JournalEntry[] { return this.lastJournal ? this.lastJournal.entries() : []; }
   private tools = buildTools();
   private catalogue = TOOL_CATALOG(this.tools);
 
@@ -101,7 +142,8 @@ export class Orchestrator {
         if (await this.answerPending(text, live)) return;
       }
       taskId = `t${++this.seq}`;
-      const task: Task = { id: taskId, goal: text.slice(0, 2000), steps: [], moves: 0, reports: [], unverifiedActions: new Set(), ran: 0, unverified: 0, failures: 0, epoch: 0, seen: new Map(), repeats: 0 };
+      const task: Task = { id: taskId, goal: text.slice(0, 2000), steps: [], moves: 0, reports: [], unverifiedActions: new Set(), ran: 0, unverified: 0, failures: 0, epoch: 0, seen: new Map(), repeats: 0, journal: new ActionJournal(), retries: 0, retried: new Map() };
+      this.lastJournal = task.journal;
       await this.pursue(task, live);
     } catch {
       if (live()) this.emit({ type: "task.failed", taskId, summary: "Something went wrong while doing that. You can retry.", recoverable: true });
@@ -131,6 +173,8 @@ export class Orchestrator {
 
   /** Drop the current goal: pending questions are forgotten and late results are discarded. */
   cancel(): void {
+    // whatever the real mouse and keyboard are doing stops now, and anything they hold is let go of (a drag is cancelled, not dropped)
+    try { this.d.pointer?.()?.abort?.("cancel"); } catch { /* the pointer may not exist (Show Only) */ }
     if (this.lastTaskId) this.abandoned.add(this.lastTaskId);
     if (this.pending) this.abandoned.add(this.pending.task.id);
     if (this.abandoned.size > 200) this.abandoned = new Set([...this.abandoned].slice(-100));
@@ -196,8 +240,8 @@ export class Orchestrator {
   }
 
   /** Record a step for the planner to see. */
-  private note(task: Task, tool: string, args: unknown, outcome: "ok" | "unverified" | "failed" | "declined", text: string): void {
-    task.steps.push({ kind: "tool", tool, args, outcome, text });
+  private note(task: Task, tool: string, args: unknown, outcome: "ok" | "unverified" | "failed" | "declined", text: string, meta: { failure?: Failure; acted?: Acted } = {}): void {
+    task.steps.push({ kind: "tool", tool, args, outcome, text, ...(meta.failure ? { failure: meta.failure } : {}), ...(meta.acted ? { acted: meta.acted } : {}) });
     if (outcome === "failed") task.failures++;
   }
 
@@ -234,16 +278,50 @@ export class Orchestrator {
     // a step that DOES something is announced aloud ("Opening D:\Projects…"); looking things up is not
     const doing = call.tool.risk(call.args);
     this.emit({ type: "task.state", taskId: task.id, state: "working", message: call.tool.working(call.args), speak: doing === "reversible" || doing === "consequential" });
-    let out: ToolOutcome;
-    try { out = await call.tool.run(call.args, ctx); } catch { out = { ok: false, reason: "That step hit an unexpected problem." }; }
+    // did any input REACH the app during this step? The real mouse and keyboard know exactly (each try starts counting from zero)
+    let pointer: ReturnType<NonNullable<AgentDeps["pointer"]>> | undefined;
+    try { pointer = this.d.pointer?.(); } catch { pointer = undefined; }
+    const originalArgs = call.args;
+    const intent = task.journal.fingerprint(call.tool.name, originalArgs);
+    let tries = 1;
+    let r = await this.executeOnce(task, call, ctx, pointer, live, tries);
+    if (r.stop) return "stop";
+    let delivered: Acted | undefined = r.delivered;
+
+    // BOUNDED RETRY (phase 4c). Decided in ONE place (recovery/policy.ts): only when nothing was sent, only for a read or a reversible step,
+    // only for a failure a fresh look can fix, never after a cancel or a takeover, one retry per call and two per task. The target is found
+    // again (positions dropped), the result is verified like any other, and a retry that sends anything is final.
+    while (!r.out.ok && r.failure && !("needsConfirmation" in r.out) && !("ambiguous" in r.out)) {
+      let interrupted = false;
+      try { interrupted = !!pointer?.interrupted?.(); } catch { interrupted = false; }
+      const dec = decideRetry({
+        kind: r.failure.kind, acted: maxActed(r.failure.acted, delivered), risk: r.base, verdict: r.verdict,
+        intentRetries: task.retried.get(intent) ?? 0, taskRetries: task.retries, mayHaveRun: task.journal.mayHaveRun(call.tool.name, call.args, r.seq),
+        live: live(), interrupted, windowHung: r.facts.windowHung === true, windowBlocked: r.facts.windowBlockedByDialog === true || r.facts.newWindowAppeared === true,
+      });
+      task.journal.update(r.seq, { evidence: [{ kind: dec.retry ? "retry_decided" : "retry_declined", ok: dec.retry }] });
+      if (!dec.retry) break;
+      const parsed = call.tool.schema.safeParse(refreshArgs(call.args, dec.refresh));
+      if (!parsed.success) break;
+      task.retries++;
+      task.retried.set(intent, (task.retried.get(intent) ?? 0) + 1);
+      task.journal.update(r.seq, { phase: "retrying" });
+      this.emit({ type: "task.state", taskId: task.id, state: "working", message: "Looking again and trying once more…" });
+      call = { ...call, args: parsed.data };
+      tries++;
+      r = await this.executeOnce(task, call, { ...ctx }, pointer, live, tries);
+      if (r.stop) return "stop";
+      delivered = maxActed(delivered, r.delivered);
+    }
+    const { out, failure, verdict, base, isAction } = r;
     if (!live()) return "stop";
     // the verdict on the shadow cursor is tied to the verification result: verified = confirmed; ok but not verified = NOT confirmed; else failed
     if (pointed) {
       if (out.ok) this.emit({ type: "cursor.result", state: out.verified ? "verified" : "unconfirmed", text: (out.verified ? (out.shown ?? "Confirmed") : "Not confirmed").slice(0, 100) });
       else if (!("needsConfirmation" in out) && !("ambiguous" in out) && out.reason !== "cancelled") this.emit({ type: "cursor.result", state: "failed", text: out.reason.slice(0, 90) });
     }
-    const base = call.tool.risk(call.args);
-    const isAction = base === "reversible" || base === "consequential"; // changed something on the PC
+    const keyOf = (a: Record<string, unknown>) => `${call.tool.name}:${JSON.stringify(a)}`;
+    const blockRepeat = () => { task.unverifiedActions.add(keyOf(originalArgs)); task.unverifiedActions.add(keyOf(call.args)); };
 
     if (out.ok) {
       // after opening something, the shadow cursor glides to the window that appeared
@@ -253,10 +331,13 @@ export class Orchestrator {
       }
       if (isAction) { task.epoch++; this.d.world.notify("focus_changed"); } // what was observed before may no longer be true
       task.ran++;
-      if (!out.verified) { task.unverified++; if (isAction) task.unverifiedActions.add(`${call.tool.name}:${JSON.stringify(call.args)}`); }
+      // an action that succeeded delivered its input; a read delivered nothing
+      const acted: Acted = isAction ? maxActed(out.acted ?? "yes", delivered) : "no";
+      const unverifiedFailure: Failure | undefined = out.verified ? undefined : { kind: "unverified", acted };
+      if (!out.verified) { task.unverified++; if (isAction && verdict !== "absent") blockRepeat(); }
       const withheld = call.tool.sensitive && !(this.d.ai?.canSeeScreen() ?? false);
       if (withheld) task.reports.push({ text: out.report, epoch: task.epoch });
-      this.note(task, call.tool.name, call.args, out.verified ? "ok" : "unverified", withheld ? WITHHELD : out.brief);
+      this.note(task, call.tool.name, call.args, out.verified ? "ok" : "unverified", withheld ? WITHHELD : out.brief, { acted, failure: unverifiedFailure });
       return "continue";
     }
     if ("needsConfirmation" in out) {
@@ -271,8 +352,109 @@ export class Orchestrator {
       return "suspended";
     }
     if (out.reason === "cancelled") return "stop";
-    this.note(task, call.tool.name, call.args, "failed", out.reason);
+    const failureOut: Failure = failure ?? describeFailure({ reason: out.reason, risk: base, delivered });
+    const actedFinal: Failure = { kind: failureOut.kind, acted: maxActed(failureOut.acted, delivered) };
+    // it may have happened and nothing shows it did not: the same exact action is not repeated blindly (the planner is told to look first)
+    if (isAction && actedFinal.acted !== "no" && verdict !== "absent" && !isTerminal(actedFinal.kind)) blockRepeat();
+    this.note(task, call.tool.name, call.args, "failed", out.reason, { failure: actedFinal, acted: actedFinal.acted });
     return this.tooMany(task) ? "stop" : "continue";
+  }
+
+  /**
+   * One TRY of a step: run it, name what went wrong, and (when it may have run or could not be confirmed) LOOK, read-only. Returns what is known.
+   * Used once for every step and, at most once more, for a bounded retry (see `attempt`).
+   */
+  private async executeOnce(task: Task, call: Call, ctx: { d: AgentDeps; live: () => boolean; confirmed: boolean; lock?: string }, pointer: ReturnType<NonNullable<AgentDeps["pointer"]>> | undefined, live: () => boolean, attemptNo: number): Promise<Attempt> {
+    const base = call.tool.risk(call.args);
+    const isAction = base === "reversible" || base === "consequential"; // changed something on the PC
+    const facts: Evidence = {};
+    // the windows that exist now: anything else that shows up while the step runs is a dialog, a popup or a new app (only their number is kept)
+    let baseline: Set<number> | undefined;
+    if (isAction) { try { baseline = new Set((await this.d.desktopAgent.snapshot()).windows.map((w) => w.hwnd)); } catch { baseline = undefined; } }
+    try { pointer?.resetActed?.(); } catch { /* the pointer may be gone */ }
+    const seq = task.journal.begin(call.tool.name, call.args, { attempt: attemptNo });
+    let out: ToolOutcome;
+    let threw = false;
+    try { out = await call.tool.run(call.args, ctx); } catch { threw = true; out = { ok: false, reason: "That step hit an unexpected problem." }; }
+    let delivered: Acted | undefined;
+    try { delivered = pointer?.actedSince?.(); } catch { delivered = undefined; }
+    const stoppedNow = (): Attempt => { task.journal.update(seq, { phase: "cancelled", acted: delivered ?? "no" }); return { stop: true, out, threw, delivered, facts, seq, base, isAction }; };
+    if (!live()) return stoppedNow();
+
+    // name a failure, and say whether anything got through (a tool that threw is unknown: "maybe" for anything that changes things)
+    const isFailure = !out.ok && !("needsConfirmation" in out) && !("ambiguous" in out) && out.reason !== "cancelled";
+    let failure: Failure | undefined;
+    if (isFailure && !out.ok && "reason" in out) {
+      const f = describeFailure({ reason: out.reason, risk: base, delivered, explicitKind: out.failure?.kind, explicitActed: out.failure?.acted });
+      failure = threw && isAction ? { kind: f.kind, acted: maxActed(f.acted, "maybe") } : f;
+    }
+    if (out.ok) task.journal.update(seq, { phase: "ran", acted: isAction ? maxActed(out.acted ?? "yes", delivered) : "no", ...(out.verified ? { evidence: [{ kind: "tool_verified" as const, ok: true }] } : { evidence: [{ kind: "tool_unverified" as const, ok: null }] }) });
+    else if (failure) task.journal.update(seq, { phase: "failed", acted: failure.acted, failure: failure.kind });
+
+    // VERIFY-ONLY RECOVERY (4b) with the frozen-window and dialog handling (4d). An action that MAY have run, or ran and could not be confirmed, is
+    // not repeated and not trusted: it is LOOKED AT. The look is read-only (the view below can only read), stops the moment the task is
+    // cancelled or the user takes over, and only real evidence can turn it into a success.
+    const needsLook = isAction && ((out.ok && !out.verified) || (!!failure && failure.acted !== "no" && !isTerminal(failure.kind)));
+    // a failed READ or a step that sent nothing is also worth a quick look at the window when the failure could be a frozen or blocked app
+    const worthChecking = !needsLook && !!failure && !isTerminal(failure.kind) && (failure.kind === "timeout" || failure.kind === "uia_failed" || failure.kind === "input_failed");
+    let verdict: "verified" | "absent" | "unconfirmed" | undefined;
+    if (needsLook || worthChecking) {
+      task.journal.update(seq, { phase: "observing" });
+      const view: ReadOnlyView = {
+        live: () => live(),
+        interrupted: () => { try { return !!pointer?.interrupted?.(); } catch { return false; } },
+        sleep: this.d.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms))),
+        windowState: (h) => this.d.actionAgent.state(h),
+        windows: () => this.d.desktopAgent.snapshot(),
+        readWindow: (h) => this.d.uiAgent.read(h),
+        popups: async () => { const r = await this.d.uiAgent.transients(); return r.ok ? r.windows : null; },
+        verifier: this.d.verifier,
+      };
+      // the window the user is working in is the one to watch when the step names none
+      let watch: StepTarget | undefined;
+      try { const fg = this.d.foreground?.lastExternal(); if (fg && Number.isSafeInteger(fg.hwnd) && fg.hwnd > 0) watch = { hwnd: fg.hwnd, pid: fg.pid }; } catch { watch = undefined; }
+      const confirm = needsLook ? call.tool.confirm : undefined;
+      const lookInput = { target: out.ok ? out.target : undefined, watch, baseline, confirm: confirm ? (t: StepTarget | undefined, v: ReadOnlyView) => confirm.call(call.tool, call.args, t, v) : undefined, view };
+      let looked = await verifyOnly(lookInput);
+      task.journal.update(seq, { evidence: looked.evidence });
+      if (looked.cancelled || !live()) return stoppedNow();
+      // A frozen window is sent NOTHING (input to it is queued and would fire later). Wait, read-only and bounded, for it to answer, then look again:
+      // the input that was already sent may have landed in the meantime.
+      const hwndToWatch = (out.ok ? out.target?.hwnd : undefined) ?? watch?.hwnd;
+      if (looked.facts.windowHung === true && hwndToWatch) {
+        task.journal.update(seq, { phase: "waiting" });
+        const res = await waitResponsive(view, hwndToWatch);
+        if (res === "cancelled" || !live()) return stoppedNow();
+        task.journal.update(seq, { evidence: [res === "responsive" ? { kind: "responsive_again", ok: true } : res === "still_hung" ? { kind: "still_hung", ok: true } : { kind: "window_exists", ok: false }] });
+        if (res === "responsive") {
+          task.journal.update(seq, { phase: "observing" });
+          looked = await verifyOnly(lookInput);
+          task.journal.update(seq, { evidence: looked.evidence });
+          if (looked.cancelled || !live()) return stoppedNow();
+          looked.facts.windowHung = false;
+        } else if (res === "gone") looked.facts.windowExists = false;
+      }
+      Object.assign(facts, looked.facts);
+      verdict = looked.verdict;
+      task.journal.update(seq, { phase: verdict === "verified" ? "verified" : verdict === "absent" ? "not_effective" : "unconfirmed" });
+      if (failure) {
+        // what was actually seen (the window is hung / gone / blocked by a dialog) can name the failure better than the sentence did
+        failure = describeFailure({ reason: !out.ok && "reason" in out ? out.reason : undefined, risk: base, delivered, explicitActed: failure.acted, evidence: looked.facts, explicitKind: failure.kind === "unknown" || failure.kind === "timeout" || failure.kind === "uia_failed" || failure.kind === "input_failed" ? undefined : failure.kind });
+        task.journal.update(seq, { failure: failure.kind });
+      }
+      if (verdict === "verified") {
+        // real evidence that the effect is there: now (and only now) it counts as done
+        if (out.ok) out = { ...out, verified: true, shown: "Confirmed afterwards" };
+        else {
+          const said = "reason" in out ? out.reason : "";
+          out = { ok: true, brief: `${said} Looking afterwards shows it did happen.`, report: `${said} Looking afterwards shows it did happen.`, verified: true, shown: "Confirmed afterwards", acted: "yes" };
+        }
+        failure = undefined;
+      } else {
+        out = annotate(out, facts);
+      }
+    }
+    return { out, threw, delivered, failure, verdict, facts, seq, base, isAction };
   }
 
   /** "I found 3 matches: 1) Folder: Projects — D:\Projects …  Which one?": names AND full paths, so nothing is a guess. */
@@ -317,6 +499,7 @@ export class Orchestrator {
     this.clearPending();
     if (!approved) {
       p.task.steps.push({ kind: "tool", tool: p.call.tool.name, args: p.call.args, outcome: "declined", text: "The user said no." });
+      p.task.journal.update(p.task.journal.begin(p.call.tool.name, p.call.args), { phase: "declined" }); // nothing was sent
       this.emit({ type: "task.state", taskId: p.task.id, state: "idle", message: "Okay, I won't do that." });
       return;
     }

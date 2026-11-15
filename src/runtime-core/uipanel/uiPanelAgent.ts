@@ -1,4 +1,5 @@
-import type { ElementAtResult, ScreenPort, UiNode, UiReadResult } from "../shared/ports";
+import type { ElementAtResult, MenuResult, ScreenPort, TransientsResult, UiNode, UiReadResult } from "../shared/ports";
+import { TransientRegistry } from "./transientRegistry";
 import { boxKey, usable } from "../shared/screenText";
 import type { WorldModel } from "../verifier";
 import { understand, withPicture, type Understanding, type UnderstandCtx } from "./understand";
@@ -62,6 +63,29 @@ export class UiPanelAgent {
     const pad = 4;
     const c = await this.screen.capture(hwnd, { l: r.l - pad, t: r.t - pad, w: Math.min(r.w + pad * 2, 900), h: Math.min(r.h + pad * 2, 600) });
     return c.ok ? { png: c.png } : { reason: c.reason };
+  }
+
+  /** the popups, dialogs and menus Momo has seen recently (handles and kinds only, in memory, short-lived) */
+  readonly popups = new TransientRegistry();
+
+  /** the visible menus, dialogs, dropdowns and popups the normal window list skips (what is seen is also remembered for a short while) */
+  async transients(owner?: number): Promise<TransientsResult> {
+    if (!this.screen.transients) return { ok: false, reason: "not available" };
+    const r = await this.screen.transients(owner);
+    if (r.ok && !owner) this.popups.observe(r.windows);
+    return r;
+  }
+
+  /** what a field holds right now (only to compare it with what was typed) */
+  async fieldValue(hwnd: number, rid: string): Promise<{ ok: true; value: string } | { ok: false; reason: string }> {
+    if (!this.screen.fieldValue) return { ok: false, reason: "not available" };
+    return this.screen.fieldValue(hwnd, rid);
+  }
+
+  /** the items of the menu in one popup window, with their hierarchy */
+  async menu(hwnd: number): Promise<MenuResult> {
+    if (!this.screen.readMenu) return { ok: false, reason: "not available" };
+    return this.screen.readMenu(hwnd);
   }
 
   /** the control under a screen point right now (and its parents), or null when that cannot be told fast enough to trust */
