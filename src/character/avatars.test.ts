@@ -241,3 +241,11 @@ describe("online voice ids", () => {
     for (const id of Object.values(CLOUD_VOICE_IDS)) expect(id).toMatch(/^[A-Za-z0-9]{20}$/);
   });
 });
+
+
+describe("display size", () => {
+  it("the girl is drawn at full size (her head is complete, so nothing needs shrinking); the option stays for any avatar", () => {
+    expect(AVATARS.bob.displayScale ?? 1).toBe(1);
+    expect(AVATARS.dark.displayScale ?? 1).toBe(1);
+  });
+});

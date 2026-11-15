@@ -1,4 +1,4 @@
-import type { ScreenPort, UiNode, UiReadResult } from "../shared/ports";
+import type { ElementAtResult, ScreenPort, UiNode, UiReadResult } from "../shared/ports";
 import { boxKey, usable } from "../shared/screenText";
 import type { WorldModel } from "../verifier";
 import { understand, withPicture, type Understanding, type UnderstandCtx } from "./understand";
@@ -64,6 +64,12 @@ export class UiPanelAgent {
     return c.ok ? { png: c.png } : { reason: c.reason };
   }
 
+  /** the control under a screen point right now (and its parents), or null when that cannot be told fast enough to trust */
+  async elementAt(x: number, y: number): Promise<ElementAtResult> {
+    if (!this.screen.elementAt) return { ok: false, reason: "not available" };
+    return this.screen.elementAt(x, y);
+  }
+
   async read(hwnd: number): Promise<UiReadResult> {
     this.calls++;
     const r = await this.screen.readUi(hwnd);
@@ -74,6 +80,6 @@ export class UiPanelAgent {
       props: { elements: items.length, truncated: r.truncated },
       source: "uia", confidence: 0.9,
     });
-    return { ok: true, items, truncated: r.truncated, hadPasswordField: r.items.some((n) => n.password) };
+    return { ok: true, items, truncated: r.truncated, hadPasswordField: r.items.some((n) => n.password), passwordFocused: r.items.some((n) => n.password && !!n.focused) };
   }
 }

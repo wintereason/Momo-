@@ -34,8 +34,8 @@ export function speechFor(e: RuntimeEvent): Spoken | null {
       return { text: e.summary, queue: false };
     case "task.clarification_required": {
       if (e.options && e.options.length > 0) {
-        const list = e.options.map((o, i) => spokenOption(o.label, o.detail, i)).join(". ");
-        return { text: `I found ${e.options.length} matches. ${list}. Which one?`, queue: false };
+        // the choices are shown on screen as separate bubbles: only ask, never read the whole list out
+        return { text: `I found ${e.options.length} matches. Which one do you want?`, queue: false };
       }
       return { text: e.question, queue: false };
     }

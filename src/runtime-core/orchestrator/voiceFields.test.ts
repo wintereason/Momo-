@@ -172,6 +172,14 @@ describe("the ghost gets to arrive before Momo acts, and shows window-level task
     await t.session.handleTranscript("s", "select the search bar");
     expect(t.order.some((o) => o.startsWith("wait:800"))).toBe(false);
   });
+  it("selecting a box first LOOKS at the screen (the window), and only then moves to the box", async () => {
+    const t = runLead([bar], [tool("select_field", { label: "search bar" }), done("ok")], 800);
+    await t.session.handleTranscript("s", "select the search bar");
+    const iLook = t.events.findIndex((e) => e.type === "cursor.window" && (e as { action: string }).action === "look");
+    const iMove = t.events.findIndex((e) => e.type === "cursor.move" || e.type === "cursor.aim");
+    expect(iLook).toBeGreaterThanOrEqual(0);
+    expect(iMove).toBeGreaterThan(iLook);
+  });
   it("switching to, minimizing or closing a window points the ghost at that window first", async () => {
     for (const [name, action] of [["focus_window", "focus"], ["minimize_window", "minimize"], ["close_window", "close"]] as const) {
       const t = runLead([bar], [tool(name, { window: "Google Chrome" }), done("ok")], 800);

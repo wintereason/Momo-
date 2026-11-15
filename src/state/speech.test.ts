@@ -13,12 +13,12 @@ describe("what Momo says aloud", () => {
     expect(speechFor({ type: "task.failed", taskId: "t1", summary: "Nothing named like \"tax\" was found on this PC.", recoverable: true })?.text).toBe("I couldn't do that. Nothing named like \"tax\" was found on this PC.");
     expect(speechFor({ type: "task.state", taskId: "t1", state: "partial_success", message: "Asked Windows to open it, but no window appeared." })?.text).toContain("no window appeared");
   });
-  it("reads the options out when it has to ask which one, with where each one is", () => {
+  it("only asks which one aloud; the options are shown on screen", () => {
     const e: RuntimeEvent = {
       type: "task.clarification_required", taskId: "t1", question: "I found 2 matches …",
       options: [{ label: "File: Resume.pdf", detail: "C:\\Users\\me\\Documents\\Resume.pdf" }, { label: "File: Resume.pdf", detail: "C:\\Users\\me\\Downloads\\Resume.pdf" }],
     };
-    expect(speechFor(e)?.text).toBe("I found 2 matches. 1: Resume.pdf, in Documents. 2: Resume.pdf, in Downloads. Which one?");
+    expect(speechFor(e)?.text).toBe("I found 2 matches. Which one do you want?");
     expect(spokenOption("Folder: Projects", "D:\\Projects", 0)).toBe("1: Projects, in D drive");
   });
   it("a question without options is read as it is; decisions are read too", () => {

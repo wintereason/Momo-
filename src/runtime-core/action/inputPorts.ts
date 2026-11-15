@@ -1,4 +1,4 @@
-import { runPowerShell } from "../shared/nodePorts";
+import { runPowerShell, uiaHost } from "../shared/nodePorts";
 import type { ActResult, InputPort, SetTextResult, SubmitResult, WindowState } from "../shared/ports";
 
 /**
@@ -201,7 +201,9 @@ export const nodeInput: InputPort = {
   async windowState(hwnd: number): Promise<WindowState> {
     if (!validHwnd(hwnd)) return { exists: false, minimized: false, pid: 0, foregroundPid: null };
     try {
-      const r = await windowCall("state", hwnd);
+      // the long-lived helper answers in milliseconds; the one-shot script (about a second) only when it is not available
+      let r: RawAct;
+      try { r = await uiaHost.request<RawAct>(`state ${hwnd}`, 4000); } catch { r = await windowCall("state", hwnd); }
       return { exists: !!r.exists, minimized: !!r.minimized, pid: r.pid ?? 0, foregroundPid: r.fgPid && r.fgPid > 0 ? r.fgPid : null };
     } catch {
       return { exists: false, minimized: false, pid: 0, foregroundPid: null };

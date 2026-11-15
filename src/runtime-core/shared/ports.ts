@@ -47,8 +47,11 @@ export interface UiNode {
   /** a menu/dropdown/tree node: "expanded" or "collapsed" */
   expanded?: string;
 }
-export type UiReadResult = { ok: true; items: UiNode[]; truncated: boolean; hadPasswordField?: boolean } | { ok: false; reason: string };
+export type UiReadResult = { ok: true; items: UiNode[]; truncated: boolean; hadPasswordField?: boolean; /** a password field has the keyboard focus right now: no key may be pressed */ passwordFocused?: boolean } | { ok: false; reason: string };
+export type OcrWordsResult = { ok: true; words: Array<{ text: string; rect: { l: number; t: number; w: number; h: number } }> } | { ok: false; reason: string };
 export type OcrResult = { ok: true; lines: string[] } | { ok: false; reason: string };
+/** The control under a point and its parents: runtime id, type, name, and whether it is a password field. In memory only. */
+export type ElementAtResult = { ok: true; chain: Array<{ rid: string; type: string; name: string; password: boolean }> } | { ok: false; reason: string };
 /** A picture of a small part of one window, in memory only (never written to disk). */
 export type CaptureResult = { ok: true; png: string; width: number; height: number } | { ok: false; reason: string };
 
@@ -57,6 +60,10 @@ export interface ScreenPort {
   readUi(hwnd: number): Promise<UiReadResult>;
   ocr(hwnd: number): Promise<OcrResult>;
   /** read the text inside ONE box of a window (screen pixels): the text of an icon, or of the label next to it. Absent in simple fakes. */
+  /** the words on a window with where each one is on screen (physical pixels), from the same local OCR. Used only when UI Automation cannot name a control. */
+  ocrWords?(hwnd: number): Promise<OcrWordsResult>;
+  /** what is under one point of the screen right now, and its parents (innermost first): used to check a target just before a real click. Absent in simple fakes. */
+  elementAt?(x: number, y: number): Promise<ElementAtResult>;
   ocrRegion?(hwnd: number, rect: { l: number; t: number; w: number; h: number }): Promise<OcrResult>;
   /** a PNG (base64) of one box of a window, for a visual AI to look at. Only ever sent anywhere after the user agrees. */
   capture?(hwnd: number, rect: { l: number; t: number; w: number; h: number }): Promise<CaptureResult>;
@@ -78,7 +85,9 @@ export interface WindowState {
 }
 
 /** Where a real pointer click would land, and whether the user took the mouse back while it travelled. */
-export type PointerResult = { ok: true } | { ok: false; reason: "user_moved" | "covered" | "failed" | "stopped" | "moved" };
+export type PointerResult = { ok: true } | { ok: false; reason: "user_moved" | "covered" | "failed" | "stopped" | "moved" | "gone" | "changed" | "password" | "offscreen" | "cursor_refused" | "focus_changed" | "cancelled" };
+/** The caller's last check of the TARGET, asked about the exact point a button is about to go down on. A check that fails (or cannot run) means: no press. */
+export type TargetCheck = (pt: { x: number; y: number }) => Promise<{ ok: true } | { ok: false; reason: string }>;
 /**
  * The REAL mouse and keyboard, used to act the way a person does (the human-like mode in Settings). It is only ever used on a
  * target that was identified first, and it gives up the moment the user touches the mouse or presses Esc.
@@ -88,17 +97,27 @@ export interface PointerPort {
    * Glide the real pointer to a screen point over `ms`, then press the button. `expectRoot` is the window that must be under the
    * pointer when it arrives (a covered target is refused, never clicked blindly).
    */
-  click(x: number, y: number, opts: { ms: number; /** the window must be exactly here (as it was when read): refused with "moved" if it was dragged since */ expectWindow?: { hwnd: number; rect: { l: number; t: number; w: number; h: number } }; expectRoot?: number; /** window class names that may be under the pointer (the taskbar's, for a taskbar button) */ expectClass?: string[]; double?: boolean }): Promise<PointerResult>;
+  click(x: number, y: number, opts: { ms: number; /** the window must be exactly here (as it was when read): refused with "moved" if it was dragged since */ expectWindow?: { hwnd: number; rect: { l: number; t: number; w: number; h: number } }; expectRoot?: number; /** window class names that may be under the pointer (the taskbar's, for a taskbar button) */ expectClass?: string[]; double?: boolean; /** default "left" */ button?: "left" | "right"; /** asked just before the press: is what is under the pointer still the control that was meant? */ verifyTarget?: TargetCheck }): Promise<PointerResult>;
+  /** Drag with the left button held from one point to another (the button is always let go again). Only the start is guarded; `dropRoot` optionally requires a window under the drop point. */
+  drag?(from: { x: number; y: number }, to: { x: number; y: number }, opts: { ms?: number; expectRoot?: number; expectWindow?: { hwnd: number; rect: { l: number; t: number; w: number; h: number } }; dropRoot?: number; /** the window the item is dropped into must still exist */ dropWindow?: number; /** checked at the start (is that still the item?) and just before the drop (is that still the place?) */ verifySource?: TargetCheck; verifyDrop?: TargetCheck }): Promise<PointerResult>;
+  /** Scroll the wheel at a point: positive = down, negative = up, in notches. */
+  scroll?(x: number, y: number, notches: number, opts: { ms?: number; expectRoot?: number; expectWindow?: { hwnd: number; rect: { l: number; t: number; w: number; h: number } } }): Promise<PointerResult>;
   /** Press keys as a person would, e.g. "enter", "ctrl+a". Goes to whatever window is in front. */
-  press(keys: string): Promise<PointerResult>;
+  press(keys: string, opts?: { /** the window that must have the keyboard focus: nothing is sent if another one has it */ expectForeground?: number }): Promise<PointerResult>;
   /** Type text letter by letter (Unicode), into whatever has the keyboard focus. */
-  type(text: string, perKeyMs?: number): Promise<PointerResult>;
+  type(text: string, perKeyMs?: number, opts?: { /** typing stops (with "focus_changed") the moment another window takes the keyboard, and with "gone" if the window closes */ expectForeground?: number; expectWindow?: number }): Promise<PointerResult>;
   /** The top-level window under a screen point (0 when none). */
   windowAt(x: number, y: number): number;
   /** Where a window is on screen right now, in physical pixels (null when it is gone). */
   windowRect?(hwnd: number): { l: number; t: number; w: number; h: number } | null;
   /** "mouse" / "esc" if the user took over during this task (everything stops), else null. */
   interrupted?(): "mouse" | "esc" | null;
+  /** Cancel / quit: stop at once and let go of anything held (a drag is cancelled, not dropped) */
+  abort?(why?: "cancel" | "quit"): void;
+  /** let go of every button and key Momo is holding (a no-op when none is) */
+  releaseAll?(): number;
+  /** how many buttons and keys Momo is holding right now */
+  heldCount?(): number;
 }
 
 /**

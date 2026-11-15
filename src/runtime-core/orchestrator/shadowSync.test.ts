@@ -78,7 +78,7 @@ describe("the order of things on screen", () => {
   it("highlights the exact element with what it is for, THEN the real pointer clicks, THEN 'checking', THEN the verified result", async () => {
     const t = setup({ onClick: expand });
     await t.session.handleTranscript("s", "click sort");
-    expect(t.timeline).toEqual(["cursor.aim", "pointer.click", "cursor.result:verifying", "cursor.result:verified"]);
+    expect(t.timeline).toEqual(["cursor.window", "cursor.aim", "pointer.click", "cursor.result:verifying", "cursor.result:verified"]);
     const aim = t.events.find((e) => e.type === "cursor.aim") as { x: number; y: number; w: number; h: number; say?: string; kind?: string };
     expect([aim.x, aim.y, aim.w, aim.h]).toEqual([640, 198, 80, 36]); // exactly the control's own box
     expect(aim.say).toBe("Clicking “Sort”: opens a menu or a list of options");

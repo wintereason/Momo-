@@ -1,4 +1,4 @@
-import type { OcrResult, ScreenPort } from "../shared/ports";
+import type { OcrResult, OcrWordsResult, ScreenPort } from "../shared/ports";
 import { cleanScreenText } from "../shared/screenText";
 import type { WorldModel } from "../verifier";
 
@@ -21,5 +21,12 @@ export class VisualAgent {
     // a blank capture (common for GPU-drawn apps) is "nothing readable", not a successful read of nothing
     if (lines.length === 0) return { ok: false, reason: "nothing readable was found in the screenshot" };
     return { ok: true, lines };
+  }
+
+  /** Every word on the window with its box on screen: the fallback for a control UI Automation cannot name. Read fresh each time, never cached. */
+  async words(hwnd: number): Promise<OcrWordsResult> {
+    if (!this.screen.ocrWords) return { ok: false, reason: "this build cannot read where words are" };
+    this.calls++;
+    return this.screen.ocrWords(hwnd);
   }
 }

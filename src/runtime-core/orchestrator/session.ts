@@ -9,6 +9,7 @@ import type { AiService } from "./ai/service";
 import { UiPanelAgent } from "../uipanel";
 import { VisualAgent } from "../vision";
 import { DEFAULT_POLICY, type Policy } from "../action";
+import type { ChangeSource } from "../shared/changeWatch";
 import { localClean, type DictationOutcome, type DictationStyle } from "./dictation";
 import { LanguageTeacherAgent } from "../languageTeacher";
 import { Verifier } from "../verifier";
@@ -33,6 +34,8 @@ export interface SessionDeps {
   selfPids?: () => number[];
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
+  /** where change events come from (the helper's window-event hook); without it, waits poll */
+  changes?: ChangeSource;
   confirmTimeoutMs?: number;
   taskTimeoutMs?: number;
   verifyAttempts?: number;
@@ -81,7 +84,7 @@ export class Session {
       world: this.world, fsAgent: this.fsAgent, desktopAgent: this.desktopAgent, actionAgent: this.actionAgent,
       uiAgent: this.uiAgent, visualAgent: this.visualAgent, appAgent: this.appAgent, foreground: deps.foreground, ai: deps.ai, languageSummary: () => this.teacher.getSummary(),
       verifier: new Verifier(), fs: deps.fs, policy: () => this.policy,
-      sleep: deps.sleep, confirmTimeoutMs: deps.confirmTimeoutMs, taskTimeoutMs: deps.taskTimeoutMs, verifyAttempts: deps.verifyAttempts, maxSteps: deps.maxSteps, cursorLeadMs: deps.cursorLeadMs, pointer: deps.pointer,
+      sleep: deps.sleep, changes: deps.changes, confirmTimeoutMs: deps.confirmTimeoutMs, taskTimeoutMs: deps.taskTimeoutMs, verifyAttempts: deps.verifyAttempts, maxSteps: deps.maxSteps, cursorLeadMs: deps.cursorLeadMs, pointer: deps.pointer,
       emit: (e) => { if (!this.disposed) deps.emit(e); },
     });
   }

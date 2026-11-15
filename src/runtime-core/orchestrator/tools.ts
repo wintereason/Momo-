@@ -5,7 +5,7 @@ import { browserKeyFor, hintWords, matchProfileHint, profileLabels, siteUrl, typ
 import { BROWSER_PROCESSES, browserName, extractPage, isPrivateWindow, matchTabs } from "../browser";
 import type { DesktopAgent, DesktopSnapshot } from "../desktop";
 import type { DriveInfo, FileSystemAgent } from "../filesystem";
-import type { BrowserKey, BrowserProfile, ForegroundPort, FsPort, PointerPort, UiNode } from "../shared/ports";
+import type { BrowserKey, BrowserProfile, ForegroundPort, FsPort, PointerPort, PointerResult, UiNode, UiReadResult } from "../shared/ports";
 import {
   MAX_LINES, SPARSE_TEXT_CHARS, boxKey, cleanScreenText, describePlace, onScreen, collectControls, collectText, errorLines, matchControls, signature, totalChars, visibleNames,
 } from "../shared/screenText";
@@ -13,6 +13,7 @@ import type { UiPanelAgent } from "../uipanel";
 import { describeUnderstanding, needsUserSayso, understand, withPicture, type Kind, type Understanding } from "../uipanel";
 import type { Verifier, WorldModel } from "../verifier";
 import type { VisualAgent } from "../vision";
+import { waitFor, relevantTo, type ChangeSource } from "../shared/changeWatch";
 import type { AiService } from "./ai/service";
 
 /**
@@ -42,6 +43,8 @@ export interface AgentDeps {
   /** delivers events to the UI; every event is validated before it leaves */
   emit(e: RuntimeEvent): void;
   sleep?(ms: number): Promise<void>;
+  /** change events (window opened/closed, focus, menu, dialog, ...): waits end as soon as something happens, and poll when this is missing or unhealthy */
+  changes?: ChangeSource;
   /** how long a confirmation stays open before it lapses (default 60 s) */
   confirmTimeoutMs?: number;
   /** how long one stretch of work may run before Momo gives up on it (default 120 s) */
@@ -160,22 +163,20 @@ const typeWord = (t: string): string =>
 
 /** Wait until a browser (never a private window, never Momo) is really showing a site. Returns its name, or null when it could not be confirmed. */
 async function confirmPage(ctx: ToolCtx, host: string): Promise<string | null | undefined> {
-  const sleep = sleeper(ctx);
-  for (let i = 0; i < attempts(ctx, 4); i++) { // a browser can take a while to start and load
-    await sleep(800);
-    if (!ctx.live()) return undefined;
+  // a browser can take a while to start and load: look when its window appears or changes, and at least every so often, up to a limit
+  const r = await until(ctx, async () => {
     const snap = await ctx.d.desktopAgent.snapshot();
-    if (!ctx.live()) return undefined;
+    if (!ctx.live()) return false;
     const w = snap.active && !snap.active.isMomo && BROWSER_PROCESSES.test(snap.active.process) && !isPrivateWindow(snap.active.title) ? snap.active : null;
-    if (!w) continue;
+    if (!w) return false;
     const ui = await ctx.d.uiAgent.read(w.hwnd);
-    if (!ctx.live()) return undefined;
-    if (!ui.ok) continue;
+    if (!ctx.live() || !ui.ok) return false;
     const page = extractPage(ui.items);
     const selected = page.tabs.find((t) => t.selected);
-    if (ctx.d.verifier.urlShown({ address: page.address, selectedTitle: selected?.name }, host).verified) return browserName(w.process);
-  }
-  return null;
+    return ctx.d.verifier.urlShown({ address: page.address, selectedTitle: selected?.name }, host).verified ? browserName(w.process) : false;
+  }, { timeoutMs: attempts(ctx, 4) * 800, pollMs: 400 });
+  if (r.cancelled) return undefined;
+  return r.value ?? null;
 }
 
 /** Tell the shadow cursor where Momo is about to act (it clicks nothing itself: it only shows the user what Momo is doing). */
@@ -264,12 +265,32 @@ async function demoAddressBar(ctx: ToolCtx, host: string): Promise<void> {
 }
 
 /** The same for a whole window (open, switch, minimize, close): the desktop shell works out where that window is. */
-async function pointAtWindow(ctx: ToolCtx, hwnd: number, action: "focus" | "minimize" | "close" | "open", label?: string): Promise<void> {
+async function pointAtWindow(ctx: ToolCtx, hwnd: number, action: "focus" | "minimize" | "close" | "open" | "look", label?: string): Promise<void> {
   const ev = parseRuntimeEvent({ type: "cursor.window", hwnd, action, label: label ? short(label, 40) : undefined });
   if (!ev) return;
   ctx.d.emit(ev);
   const lead = ctx.d.cursorLeadMs?.() ?? 0;
   if (lead > 0) await sleeper(ctx)(lead);
+}
+
+/**
+ * Before picking ANY control, look at the screen like a person: glance over the windows that are really shown (up to two others, front to back),
+ * then settle on the window the control is in. Only the shadow cursor is told (nothing is moved or clicked); a no-op when the cursor is off.
+ */
+async function lookAround(ctx: ToolCtx, win: Win): Promise<void> {
+  const lead = ctx.d.cursorLeadMs?.() ?? 0;
+  if (lead <= 0) return;
+  let others: Array<{ hwnd: number; title: string }> = [];
+  try {
+    const snap = await ctx.d.desktopAgent.snapshot();
+    others = snap.windows.filter((q) => !q.isMomo && q.hwnd !== win.hwnd && q.state !== "minimized" && q.title.trim()).slice(0, 2).map((q) => ({ hwnd: q.hwnd, title: q.title }));
+  } catch { /* the glance is only a show */ }
+  if (!ctx.live()) return;
+  for (const o of others) {
+    await pointAtWindow(ctx, o.hwnd, "look", `Looking at ${short(o.title, 28)}`);
+    if (!ctx.live()) return;
+  }
+  await pointAtWindow(ctx, win.hwnd, "look", `Checking ${short(win.title, 28)}`);
 }
 
 // ---- Acting like a person: the REAL pointer and keyboard (only while "Human-like control" is on). The ghost and the real pointer travel
@@ -279,25 +300,131 @@ const GLIDE_MS = 800;
 const humanPointer = (ctx: ToolCtx): PointerPort | undefined => ctx.d.pointer?.();
 const glideMs = (ctx: ToolCtx): number => ((ctx.d.cursorLeadMs?.() ?? 0) > 0 ? GLIDE_MS : 600);
 const stoppedWhy = (reason: string): string => (reason === "stopped" ? "You pressed Esc, so I stopped." : "You moved the mouse, so I stopped and left it to you.");
+/**
+ * The last look before a real click: what is at the EXACT point now must still be the control that was meant, and never a password field.
+ * Asked of the helper (about 10 ms). If it cannot answer, the window is read again the slow way: an old picture is never enough.
+ */
+function targetCheck(ctx: ToolCtx, win: Win, node: UiNode): (pt: { x: number; y: number }) => Promise<{ ok: true } | { ok: false; reason: "changed" | "password" }> {
+  const same = (type: string, name: string, rid: string | undefined) => (!!node.rid && !!rid && rid === node.rid) || (!!node.name && type === node.type && norm(name) === norm(node.name));
+  return async (pt) => {
+    const r = await ctx.d.uiAgent.elementAt(pt.x, pt.y);
+    if (r.ok) {
+      if (r.chain.some((c) => c.password)) return { ok: false, reason: "password" };
+      return r.chain.some((c) => same(c.type, c.name, c.rid)) ? { ok: true } : { ok: false, reason: "changed" };
+    }
+    const ui = await ctx.d.uiAgent.read(win.hwnd);
+    if (!ui.ok) return { ok: false, reason: "changed" };
+    const again = ui.items.find((n) => same(n.type, n.name, n.rid) && !!n.rect);
+    const q = again?.rect;
+    if (!q || again.password) return { ok: false, reason: "changed" };
+    return pt.x >= q.l && pt.x <= q.l + q.w && pt.y >= q.t && pt.y <= q.t + q.h ? { ok: true } : { ok: false, reason: "changed" };
+  };
+}
 const sameNode = (a: UiNode, b: UiNode): boolean => (!!a.rid && a.rid === b.rid) || (a.type === b.type && norm(a.name) === norm(b.name) && boxKey(a) === boxKey(b));
 
 /** Is this window in front and not minimized, according to Windows? */
 async function isFront(ctx: ToolCtx, win: Win): Promise<boolean> {
   const s = await ctx.d.actionAgent.state(win.hwnd);
-  return s.exists && s.foregroundPid === win.pid && !s.minimized;
+  if (!(s.exists && s.foregroundPid === win.pid && !s.minimized)) return false;
+  return true;
 }
 
-/** Bring a window to the front (restoring it if it was minimized) and wait until Windows confirms it. */
+/**
+ * Wait (never longer than `timeoutMs`) until `check` finds what an action should have caused. The first look is at once; after that it looks
+ * again when Windows reports a change (window opened/closed/shown, focus, menu, dialog, ...) and, whether or not events arrive, on a timer.
+ * The check always decides: an event only says "look now". Not found in time = timedOut (the caller reports "could not confirm").
+ */
+function until<T>(ctx: ToolCtx, check: () => Promise<T | false | null | undefined>, o: { timeoutMs: number; win?: number; pollMs?: number }) {
+  return waitFor(check, { timeoutMs: o.timeoutMs, pollMs: o.pollMs, fallbackMs: Math.max((o.pollMs ?? 150) * 2, 250), source: ctx.d.changes, relevant: relevantTo(o.win), sleep: sleeper(ctx), live: () => ctx.live() });
+}
+
+/** In front and, when the real pointer can measure it, holding still (a restore or snap animation has finished): coordinates read before that are stale. */
+async function frontAndStill(ctx: ToolCtx, win: Win, timeoutMs: number): Promise<boolean> {
+  const p = humanPointer(ctx);
+  let last = "";
+  const r = await until(ctx, async () => {
+    if (!(await isFront(ctx, win))) { last = ""; return false; }
+    if (!p?.windowRect) return true;
+    const w = p.windowRect(win.hwnd);
+    const key = w ? `${w.l},${w.t},${w.w},${w.h}` : "";
+    const still = !!key && key === last;
+    last = key;
+    return still;
+  }, { timeoutMs, win: win.hwnd, pollMs: 90 });
+  return !!r.value;
+}
+
+/** Bring a window to the front (restoring it if it was minimized) and wait until Windows confirms it, and that it has stopped moving. */
 async function bringToFront(ctx: ToolCtx, win: Win): Promise<{ front: boolean; moved: boolean }> {
   if (await isFront(ctx, win)) return { front: true, moved: false };
   for (let i = 0; i < 2; i++) {
     if (!ctx.live()) return { front: false, moved: true };
     await ctx.d.actionAgent.focusWindow({ hwnd: win.hwnd, pid: win.pid });
-    await sleeper(ctx)(500); // let the restore animation finish before anything is measured
+    if (await frontAndStill(ctx, win, 1200)) return { front: true, moved: true };
     if (!ctx.live()) return { front: false, moved: true };
-    if (await isFront(ctx, win)) return { front: true, moved: true };
   }
   return { front: false, moved: true };
+}
+
+const titlesNow = async (ctx: ToolCtx): Promise<Map<number, string>> => {
+  try { return new Map((await ctx.d.desktopAgent.snapshot()).windows.filter((w) => !w.isMomo).map((w) => [w.hwnd, w.title])); } catch { return new Map(); }
+};
+/** windows that were not there before: a dialog, a menu, a new app. Part of the evidence AND something worth telling the user. */
+const appeared = (before: Map<number, string>, after: Map<number, string>): string[] => [...after].filter(([h, t]) => !before.has(h) && t.trim()).map(([, t]) => t);
+/** Scrolling moves the PAGE, not the toolbars the first few controls of a browser are: look at (nearly) every visible control and where it sits. */
+const scrollPrint = (items: UiNode[]): string => items.filter((n) => !n.offscreen && n.rect).slice(0, 400).map((n) => `${n.type}|${norm(n.name)}|${boxKey(n)}`).join(";");
+const screenPrint = (items: UiNode[]): string => items.filter((n) => !n.offscreen && n.rect).slice(0, 40).map((n) => `${n.type}|${norm(n.name)}|${boxKey(n)}`).join(";");
+
+/**
+ * After a real action: wait until what the window shows has changed (and then stayed the same for a second look, so a half-drawn state is not
+ * taken as the result), or until `timeoutMs`. `after` is the last thing read either way; `changed` says whether a change was seen.
+ * `gone` = the window itself is no longer there.
+ */
+async function untilChanged(ctx: ToolCtx, win: Win, before: UiNode[] | null | undefined, timeoutMs = 1300, sigOf: (items: UiNode[]) => string = screenPrint, wins0?: Map<number, string>): Promise<{ after: UiReadResult; wins1: Map<number, string>; changed: boolean; gone: boolean; cancelled: boolean }> {
+  const base = before ? sigOf(before) : null;
+  let after = await ctx.d.uiAgent.read(win.hwnd);
+  let prev = "";
+  let gone = false;
+  let wins1: Map<number, string> = new Map();
+  const r = await until(ctx, async () => {
+    if (wins0) { // a dialog, menu window or new app is a change too (and it is a window the list shows at once)
+      wins1 = await titlesNow(ctx);
+      if (appeared(wins0, wins1).length > 0 || (wins0.has(win.hwnd) && !wins1.has(win.hwnd))) { after = await ctx.d.uiAgent.read(win.hwnd); return true; }
+    }
+    const src = ctx.d.changes;
+    let s0 = -1;
+    try { if (src?.healthy()) s0 = src.seq(); } catch { s0 = -1; }
+    after = await ctx.d.uiAgent.read(win.hwnd);
+    if (!after.ok) { gone = !(await ctx.d.actionAgent.state(win.hwnd)).exists; return gone ? true : false; }
+    const now = sigOf(after.items);
+    const differs = base !== null && now !== base;
+    if (!differs) { prev = now; return false; }
+    // It differs. Is it finished changing? With working events: yes when nothing relevant happened while it was being read (no second, slow read
+    // needed). Without them: only when a second look shows the same thing.
+    let quiet = false;
+    if (s0 >= 0 && src) {
+      try { quiet = src.healthy() && !(await src.next(s0, 0)).events.some(relevantTo(win.hwnd)); } catch { quiet = false; }
+    }
+    const steady = quiet || now === prev;
+    prev = now;
+    return steady;
+  }, { timeoutMs, win: win.hwnd, pollMs: 120 });
+  return { after, wins1, changed: !!r.value, gone, cancelled: r.cancelled };
+}
+
+/**
+ * A real mouse action refused as "covered" (another window sits on that spot): raise the window once and try again, instead of giving up.
+ * Every attempt is still guarded the same way (the window under the pointer must be the right one), so a retry can never click the wrong thing.
+ */
+async function retryCovered(ctx: ToolCtx, win: Win, act: () => Promise<PointerResult>): Promise<PointerResult> {
+  let r = await act();
+  if (!r.ok && r.reason === "covered" && ctx.live()) {
+    await ctx.d.actionAgent.focusWindow({ hwnd: win.hwnd, pid: win.pid });
+    await frontAndStill(ctx, win, 1200);
+    if (!ctx.live()) return r;
+    r = await act();
+  }
+  return r;
 }
 
 type Human = { done: true; node: UiNode; items?: UiNode[] } | { done: false; stop?: string };
@@ -349,12 +476,15 @@ async function humanClick(ctx: ToolCtx, win: Win, node: UiNode, action: "click" 
     const u = opts.u && attempt === 0 ? opts.u : undefined;
     await aimAt(ctx, r, cur.name, aimSay(action === "click" ? (opts.double ? "Opening" : "Clicking") : action === "select" ? "Selecting" : "Typing in", cur, u), u?.kind);
     if (!ctx.live()) return { done: false, stop: "cancelled" };
-    const res = await p.click(Math.round(r.l + r.w / 2), Math.round(r.t + r.h / 2), { ms: glideMs(ctx), expectRoot: win.hwnd, expectWindow: wrect ? { hwnd: win.hwnd, rect: wrect } : undefined, double: opts.double });
+    const res = await retryCovered(ctx, win, () => p.click(Math.round(r.l + r.w / 2), Math.round(r.t + r.h / 2), { ms: glideMs(ctx), expectRoot: win.hwnd, expectWindow: wrect ? { hwnd: win.hwnd, rect: wrect } : undefined, double: opts.double, verifyTarget: targetCheck(ctx, win, cur) }));
     if (!ctx.live()) return { done: false, stop: "cancelled" };
     if (res.ok) return { done: true, node: cur, items };
     if (res.reason === "user_moved" || res.reason === "stopped") return { done: false, stop: stoppedWhy(res.reason) };
-    if (res.reason !== "moved") return { done: false }; // covered by another window, or the click was refused: UI Automation will do it instead
-    wrect = undefined; // it moved: read it again and aim again (once)
+    if (res.reason === "cancelled") return { done: false, stop: "cancelled" };
+    if (res.reason === "password") return { done: false, stop: "That is a password field, and I never touch those. Nothing was clicked." };
+    if (res.reason === "gone") return { done: false, stop: `"${short(win.title)}" closed, so I stopped. Nothing was clicked.` };
+    if (res.reason !== "moved" && res.reason !== "changed") return { done: false }; // covered, off-screen, refused by Windows: UI Automation will do it instead (it checks the control by id)
+    wrect = undefined; // it moved or the control is no longer there: read it again and aim again (once)
   }
   return { done: false };
 }
@@ -386,12 +516,9 @@ async function clickNode(ctx: ToolCtx, win: Win, node: UiNode, before: UiNode[],
     if (!r.ok) return fail(r.reason);
   }
   ctx.d.emit({ type: "cursor.result", state: "verifying", text: "Checking…" }); // the screen is being read again: show that, not a result yet
-  await sleeper(ctx)(700);
-  if (!ctx.live()) return fail("cancelled");
-  const after = await ctx.d.uiAgent.read(win.hwnd);
-  if (!ctx.live()) return fail("cancelled");
-  let gone = false;
-  if (!after.ok) gone = !(await ctx.d.actionAgent.state(win.hwnd)).exists;
+  const seen = await untilChanged(ctx, win, h.done && h.items ? h.items : before, 1500, signature); // until the window shows a change (and holds it), not a fixed pause
+  if (seen.cancelled || !ctx.live()) return fail("cancelled");
+  const after = seen.after, gone = seen.gone;
   let verdict = ctx.d.verifier.clickEffect(sig0, after.ok ? signature(after.items) : null, gone);
   let how = gone ? "the window closed" : "the window changed";
   // what it was UNDERSTOOD to do is what gets checked: a switch must have flipped, a menu button must have opened something
@@ -438,9 +565,9 @@ async function activateRunning(ctx: ToolCtx, appName: string, w: { hwnd: number;
     const h = await humanTaskbar(ctx, appName);
     if (h.stop) return fail(h.stop);
     if (h.done) {
-      await sleeper(ctx)(600);
-      if (!ctx.live()) return fail("cancelled");
-      if (await isFront(ctx, win)) return ok(`${appName} was already running (${was}); I clicked its taskbar button and its window "${title}" is in front. I did not start another copy.`, true);
+      const up = await until(ctx, () => isFront(ctx, win), { timeoutMs: 1500, win: win.hwnd, pollMs: 100 });
+      if (up.cancelled || !ctx.live()) return fail("cancelled");
+      if (up.value) return ok(`${appName} was already running (${was}); I clicked its taskbar button and its window "${title}" is in front. I did not start another copy.`, true);
     }
   }
   await pointAtWindow(ctx, win.hwnd, "focus", title);
@@ -568,15 +695,13 @@ export function buildTools(): ToolDef[] {
       if (!ctx.live()) return fail("cancelled");
       if (!r.ok) return fail(r.reason);
       // 4) verify: a window for it must really appear
-      const sleep = sleeper(ctx);
-      for (let i = 0; i < attempts(ctx, isDir ? 1 : 3); i++) {
-        await sleep(isDir ? 600 : 900);
-        if (!ctx.live()) return fail("cancelled");
+      const shown = await until(ctx, async () => {
         const snap = await ctx.d.desktopAgent.snapshot();
-        if (!ctx.live()) return fail("cancelled");
-        const v = isDir ? ctx.d.verifier.folderWindow(snap, target) : ctx.d.verifier.fileWindow(snap, before, target);
-        if (v.verified) return ok(`Opened the ${isDir ? "folder" : "file"} ${target}; its window is showing.`, true);
-      }
+        if (!ctx.live()) return false;
+        return (isDir ? ctx.d.verifier.folderWindow(snap, target) : ctx.d.verifier.fileWindow(snap, before, target)).verified;
+      }, { timeoutMs: attempts(ctx, isDir ? 1 : 3) * (isDir ? 600 : 900), pollMs: 250 });
+      if (shown.cancelled || !ctx.live()) return fail("cancelled");
+      if (shown.value) return ok(`Opened the ${isDir ? "folder" : "file"} ${target}; its window is showing.`, true);
       return ok(`Asked Windows to open ${target}, but no window for it appeared.`, false);
     },
   });
@@ -814,15 +939,13 @@ export function buildTools(): ToolDef[] {
       const r = name === "focus_window" ? await ctx.d.actionAgent.focusWindow(t) : name === "minimize_window" ? await ctx.d.actionAgent.minimizeWindow(t) : await ctx.d.actionAgent.closeWindow(t);
       if (!ctx.live()) return fail("cancelled");
       if (!r.ok) return fail(r.reason);
-      const sleep = sleeper(ctx);
-      for (let i = 0; i < (name === "close_window" ? 4 : 2); i++) {
-        await sleep(name === "close_window" ? 700 : 400);
-        if (!ctx.live()) return fail("cancelled");
+      const done = await until(ctx, async () => {
         const s = await ctx.d.actionAgent.state(t.hwnd);
-        if (!ctx.live()) return fail("cancelled");
-        const v = name === "focus_window" ? ctx.d.verifier.windowFocused(s, t.pid) : name === "minimize_window" ? ctx.d.verifier.windowMinimized(s) : ctx.d.verifier.windowClosed(s);
-        if (v.verified) return ok(`${name === "focus_window" ? "Switched to" : name === "minimize_window" ? "Minimized" : "Closed"} "${title}"; Windows confirms it.`, true);
-      }
+        if (!ctx.live()) return false;
+        return (name === "focus_window" ? ctx.d.verifier.windowFocused(s, t.pid) : name === "minimize_window" ? ctx.d.verifier.windowMinimized(s) : ctx.d.verifier.windowClosed(s)).verified;
+      }, { timeoutMs: (name === "close_window" ? 4 : 2) * (name === "close_window" ? 700 : 400), win: t.hwnd, pollMs: 120 });
+      if (done.cancelled || !ctx.live()) return fail("cancelled");
+      if (done.value) return ok(`${name === "focus_window" ? "Switched to" : name === "minimize_window" ? "Minimized" : "Closed"} "${title}"; Windows confirms it.`, true);
       return ok(name === "focus_window" ? `Asked for "${title}" to come forward, but it did not (Windows sometimes blocks that).`
         : name === "minimize_window" ? `Asked for "${title}" to be minimized, but it still is not.`
         : `Asked "${title}" to close, but it is still open (it may be asking to save).`, false);
@@ -844,6 +967,7 @@ export function buildTools(): ToolDef[] {
       if ("out" in found) return found.out;
       if (!found.win) return fail("That window is gone.");
       const win = found.win;
+      await lookAround(ctx, win); if (!ctx.live()) return fail("cancelled");
       const wrect = humanPointer(ctx)?.windowRect?.(win.hwnd) ?? undefined; // where the window is NOW: it must still be there when the click lands
       const ui = await ctx.d.uiAgent.read(win.hwnd);
       if (!ctx.live()) return fail("cancelled");
@@ -902,6 +1026,7 @@ export function buildTools(): ToolDef[] {
       if ("out" in found) return found.out;
       if (!found.win) return fail("That window is gone.");
       const win = found.win;
+      await lookAround(ctx, win); if (!ctx.live()) return fail("cancelled");
       const ui = await ctx.d.uiAgent.read(win.hwnd);
       if (!ctx.live()) return fail("cancelled");
       if (!ui.ok) return fail(`Could not look inside "${short(win.title)}" (${ui.reason}).`);
@@ -926,14 +1051,20 @@ export function buildTools(): ToolDef[] {
           const here = sel.ok ? sel.items.find((n) => sameNode(n, h.node)) : undefined;
           if (here?.focused && !here.password) {
             const pr = humanPointer(ctx)!;
-            const k1 = await pr.press("ctrl+a");
-            const k2 = k1.ok ? await pr.type(a.text, 35) : k1;
+            const k1 = await pr.press("ctrl+a", { expectForeground: win.hwnd });
+            const k2 = k1.ok ? await pr.type(a.text, 35, { expectForeground: win.hwnd, expectWindow: win.hwnd }) : k1;
             if (!ctx.live()) return fail("cancelled");
-            if (!k2.ok && (k2.reason === "stopped" || k2.reason === "user_moved")) return fail(stoppedWhy(k2.reason));
-            await sleeper(ctx)(300);
-            const back = await ctx.d.uiAgent.read(win.hwnd);
-            if (!ctx.live()) return fail("cancelled");
-            const field = back.ok ? back.items.find((n) => sameNode(n, h.node) || (!!n.rid && n.rid === node.rid)) : undefined;
+            if (!k2.ok && k2.reason !== "failed") { const stop = mapStop(k2); if (stop) return stop; }
+            // read the field back as soon as it shows the text (up to ~1 s for a slow app), not after a fixed pause
+            let back = await ctx.d.uiAgent.read(win.hwnd);
+            const pickField = (r: UiReadResult) => (r.ok ? r.items.find((n) => sameNode(n, h.node) || (!!n.rid && n.rid === node.rid)) : undefined);
+            const tw = await until(ctx, async () => {
+              back = await ctx.d.uiAgent.read(win.hwnd);
+              const f = pickField(back);
+              return !!f && !f.password && typeof f.value === "string" && ctx.d.verifier.typed(f.value, a.text).verified;
+            }, { timeoutMs: 1000, win: win.hwnd, pollMs: 100 });
+            if (tw.cancelled || !ctx.live()) return fail("cancelled");
+            const field = pickField(back);
             if (field && !field.password && typeof field.value === "string" && ctx.d.verifier.typed(field.value, a.text).verified) return typedOutcome(field.value, a.text, node.name, ctx);
           }
         }
@@ -973,6 +1104,7 @@ export function buildTools(): ToolDef[] {
       if ("out" in found) return found.out;
       if (!found.win) return fail("That window is gone.");
       const win = found.win;
+      await lookAround(ctx, win); if (!ctx.live()) return fail("cancelled");
       const ui = await ctx.d.uiAgent.read(win.hwnd);
       if (!ctx.live()) return fail("cancelled");
       if (!ui.ok) return fail(`Could not look inside "${short(win.title)}" (${ui.reason}).`);
@@ -1048,6 +1180,384 @@ export function buildTools(): ToolDef[] {
       return r.changed
         ? ok(`Pressed Enter in "${short(node.name, 50)}" and the page or box changed afterwards.${understood.kind === "search_box" || understood.kind === "address_box" ? ` It ${scopeNote(understood) || "is a search box"}.` : ""}`, true, undefined, "Enter pressed: the page changed")
         : ok(`Pressed Enter in "${short(node.name, 50)}", but nothing visibly changed, so I couldn't confirm it worked.`, false);
+    },
+  });
+
+  // ---------------------------------------------------------------- Real mouse and keyboard, like a person (Human-like control only)
+  // Observe -> understand -> plan -> validate -> move -> act -> observe again -> verify. Each tool below reads the window fresh, picks the exact
+  // control (or asks when several match), lets the ghost show it, uses the REAL pointer/keyboard (which the user can stop with Esc or by moving
+  // the mouse), then reads the screen again and only reports what that second look shows.
+  const NEEDS_HUMAN = "This needs Human-like control (Settings → General): it uses the real mouse and keyboard, and that is off. Nothing was done.";
+  const newWinNote = (n: string[]): string => (n.length ? ` A new window appeared: “${short(n[0], 50)}”.` : "");
+  /** a quick fingerprint of what is on screen in a window, from what UI Automation shows (names + boxes of the first visible controls) */
+
+  type Picked = { node: UiNode } | { out: ToolOutcome };
+  /** one exact control by the words said, or a "which one?" when several match: never a guess. The patch keys remember the choice. */
+  function pickControl(win: Win, items: UiNode[], label: string, chosen: { rid?: string; box?: string }, patchKeys: { rid: string; box: string }, noun: string): Picked {
+    let matches = matchControls(items, label, "click");
+    if (chosen.rid || chosen.box) {
+      const exact = matches.find((n) => !!n.rid && n.rid === chosen.rid) ?? matches.find((n) => !!chosen.box && boxKey(n) === chosen.box);
+      if (exact) matches = [exact];
+    }
+    matches = matches.filter((n) => !!n.rect && !n.password);
+    if (matches.length === 0) {
+      const names = visibleNames(items, "click");
+      return { out: fail(`No "${short(label, 40)}" ${noun} in "${short(win.title)}".${names.length ? ` Visible: ${names.join(", ")}.` : ""}`) };
+    }
+    if (matches.length > 1) {
+      const opts = matches.slice(0, 6);
+      return { out: { ok: false, ambiguous: { noun: `${noun}s`, labels: opts.map((n) => `${short(n.name, 40) || "(no label)"} (${typeWord(n.type)})`), details: opts.map((n) => describePlace(n, items) || "in this window"), patches: opts.map((n) => ({ _hwnd: win.hwnd, [patchKeys.rid]: n.rid, [patchKeys.box]: boxKey(n) })) } } };
+    }
+    return { node: matches[0] };
+  }
+  const center = (r: { l: number; t: number; w: number; h: number }) => ({ x: Math.round(r.l + r.w / 2), y: Math.round(r.t + r.h / 2) });
+  const mapStop = (res: { ok: boolean; reason?: string }): ToolOutcome | null =>
+    res.ok ? null : res.reason === "user_moved" || res.reason === "stopped" ? fail(stoppedWhy(res.reason)) : res.reason === "cancelled" ? fail("cancelled") : res.reason === "password" ? fail("That is a password field, and I never touch those. Nothing was clicked.") : res.reason === "gone" ? fail("The window closed, so I stopped. Nothing further was done.") : res.reason === "changed" ? fail("What was under the pointer was not the control I meant any more, so I did not click. Look at the screen again.") : res.reason === "offscreen" ? fail("That spot is not on any screen, so I did not go there.") : res.reason === "cursor_refused" ? fail("Windows would not move the pointer there (another program may be holding it), so I did nothing.") : res.reason === "focus_changed" ? fail("Another window took the keyboard, so I stopped. Part of what I meant to send may already have gone to the first one: look at the screen.") : res.reason === "covered" ? fail("Another window is in front of that spot, so I did not click it. Look at the screen again.") : res.reason === "moved" ? fail("The window moved while I was aiming, so I stopped. Look at the screen again.") : fail("The mouse or keyboard action did not go through.");
+
+  const winLabel = z.string().trim().min(1).max(100);
+  // ---- scroll
+  add({
+    name: "scroll_window", signature: "scroll_window({direction: \"up\"|\"down\", amount?: 1-10, window?})",
+    description: "Scroll the content of a window with the real mouse wheel (a long list of files, a web page, a settings page), then check that the screen really moved. amount = how many notches (default 3). Needs Human-like control.",
+    sensitive: false, risk: "reversible",
+    schema: z.object({ direction: z.enum(["up", "down"]), amount: z.number().int().min(1).max(10).optional(), window: winArg, _hwnd: z.number().int().optional() }).strict(),
+    describe: (a) => `Scroll ${a.direction} in ${a.window ? `“${short(String(a.window), 40)}”` : "the window you were in"}?`,
+    working: (a) => `Scrolling ${a.direction}…`,
+    async run(a, ctx) {
+      const p = humanPointer(ctx);
+      if (!p?.scroll) return fail(NEEDS_HUMAN);
+      const found = await windowFor(ctx, a as { window?: string; _hwnd?: number });
+      if ("out" in found) return found.out;
+      if (!found.win) return fail("That window is gone.");
+      const win = found.win;
+      const fr = await bringToFront(ctx, win);
+      if (!ctx.live()) return fail("cancelled");
+      if (!fr.front) return fail(`I could not bring "${short(win.title)}" to the front.`);
+      const rect = p.windowRect?.(win.hwnd);
+      if (!rect) return fail("I could not tell where that window is on screen.");
+      const before = await ctx.d.uiAgent.read(win.hwnd);
+      if (!ctx.live()) return fail("cancelled");
+      const at = { x: Math.round(rect.l + rect.w / 2), y: Math.round(rect.t + rect.h * 0.6) }; // the middle of the content, below the title bar and toolbars
+      await aimAt(ctx, { l: at.x - 40, t: at.y - 20, w: 80, h: 40 }, "the page", `Scrolling ${a.direction}`, "list_item");
+      if (!ctx.live()) return fail("cancelled");
+      const n = Number(a.amount ?? 3);
+      const res = await retryCovered(ctx, win, () => p.scroll!(at.x, at.y, a.direction === "down" ? n : -n, { ms: glideMs(ctx), expectRoot: win.hwnd, expectWindow: { hwnd: win.hwnd, rect } }));
+      if (!ctx.live()) return fail("cancelled");
+      const bad = mapStop(res);
+      if (bad) return bad;
+      ctx.d.emit({ type: "cursor.result", state: "verifying", text: "Checking…" });
+      const seen = await untilChanged(ctx, win, before.ok ? before.items : null, 1000, scrollPrint);
+      if (seen.cancelled || !ctx.live()) return fail("cancelled");
+      const after = seen.after;
+      const moved = before.ok && after.ok && scrollPrint(before.items) !== scrollPrint(after.items);
+      return moved
+        ? ok(`Scrolled ${a.direction} in "${short(win.title)}"; what is on screen changed.`, true, undefined, "The screen scrolled")
+        : ok(`Scrolled ${a.direction} in "${short(win.title)}", but what is on screen did not change (the end may have been reached), so I could not confirm it moved.`, false);
+    },
+  });
+
+  // ---- right click
+  add({
+    name: "right_click", signature: "right_click({label, window?})",
+    description: "Right-click a named control or item (a file in File Explorer, a link, a tab) to open its context menu, then check what appeared. Read the menu with look_screen / understand_screen, then click_control an entry. Needs Human-like control.",
+    sensitive: false, risk: "reversible",
+    schema: z.object({ label: winLabel, window: winArg, _hwnd: z.number().int().optional(), _rid: z.string().max(200).optional(), _box: z.string().max(60).optional() }).strict(),
+    describe: (a) => `Right-click “${short(String(a.label), 50)}”?`,
+    working: (a) => `Right-clicking “${short(String(a.label), 40)}”…`,
+    async run(a, ctx) {
+      const p = humanPointer(ctx);
+      if (!p) return fail(NEEDS_HUMAN);
+      const found = await windowFor(ctx, a as { window?: string; _hwnd?: number });
+      if ("out" in found) return found.out;
+      if (!found.win) return fail("That window is gone.");
+      const win = found.win;
+      await lookAround(ctx, win); if (!ctx.live()) return fail("cancelled");
+      const fr = await bringToFront(ctx, win);
+      if (!ctx.live()) return fail("cancelled");
+      if (!fr.front) return fail(`I could not bring "${short(win.title)}" to the front.`);
+      const wrect = p.windowRect?.(win.hwnd) ?? undefined;
+      const ui = await ctx.d.uiAgent.read(win.hwnd);
+      if (!ctx.live()) return fail("cancelled");
+      if (!ui.ok) return fail(`Could not look inside "${short(win.title)}" (${ui.reason}).`);
+      const pick = pickControl(win, ui.items, String(a.label), { rid: a._rid as string | undefined, box: a._box as string | undefined }, { rid: "_rid", box: "_box" }, "control");
+      if ("out" in pick) return pick.out;
+      const node = pick.node;
+      const r = node.rect!;
+      const wins0 = await titlesNow(ctx);
+      await aimAt(ctx, r, node.name, aimSay("Right-clicking", node, know(win, node, ui.items)));
+      if (!ctx.live()) return fail("cancelled");
+      const at = center(r);
+      const res = await retryCovered(ctx, win, () => p.click(at.x, at.y, { ms: glideMs(ctx), expectRoot: win.hwnd, expectWindow: wrect ? { hwnd: win.hwnd, rect: wrect } : undefined, button: "right", verifyTarget: targetCheck(ctx, win, node) }));
+      if (!ctx.live()) return fail("cancelled");
+      const bad = mapStop(res);
+      if (bad) return bad;
+      ctx.d.emit({ type: "cursor.result", state: "verifying", text: "Checking…" });
+      const seen = await untilChanged(ctx, win, ui.items, 1500, screenPrint, wins0);
+      if (seen.cancelled || !ctx.live()) return fail("cancelled");
+      const after = seen.after, wins1 = seen.wins1;
+      const changed = after.ok && screenPrint(ui.items) !== screenPrint(after.items);
+      const nw = appeared(wins0, wins1);
+      return changed || nw.length
+        ? ok(`Right-clicked "${short(node.name, 50)}"; a menu or something new appeared.${newWinNote(nw)} Look at the screen to read its entries.`, true, undefined, "A menu opened")
+        : ok(`Right-clicked "${short(node.name, 50)}", but I could not see a menu appear, so I cannot confirm it opened.`, false);
+    },
+  });
+
+  // ---- drag and drop
+  add({
+    name: "drag_drop", signature: "drag_drop({from, to, window?, toWindow?})",
+    description: "Drag one item and drop it on another with the real mouse (a file onto a folder in File Explorer, an item into a list). `from` and `to` are the visible names; `to` is looked for in `toWindow` when the folder is in another window, otherwise in the same window. Always asks the user first (moving or copying files is hard to undo). Needs Human-like control.",
+    sensitive: false, risk: "consequential",
+    schema: z.object({ from: winLabel, to: winLabel, window: winArg, toWindow: winArg, _hwnd: z.number().int().optional(), _fr: z.string().max(200).optional(), _fb: z.string().max(60).optional(), _tr: z.string().max(200).optional(), _tb: z.string().max(60).optional(), _thwnd: z.number().int().optional() }).strict(),
+    describe: (a) => `Drag “${short(String(a.from), 50)}” onto “${short(String(a.to), 50)}”? This moves or copies it and may not be undoable.`,
+    working: (a) => `Dragging “${short(String(a.from), 40)}”…`,
+    async run(a, ctx) {
+      const p = humanPointer(ctx);
+      if (!p?.drag) return fail(NEEDS_HUMAN);
+      const found = await windowFor(ctx, a as { window?: string; _hwnd?: number });
+      if ("out" in found) return found.out;
+      if (!found.win) return fail("That window is gone.");
+      const win = found.win;
+      const toFound = a.toWindow || a._thwnd ? await windowFor(ctx, { window: a.toWindow as string | undefined, _hwnd: a._thwnd as number | undefined }) : { win };
+      if ("out" in toFound) return toFound.out;
+      if (!toFound.win) return fail("The window to drop into is gone.");
+      const twin = toFound.win;
+      const fr = await bringToFront(ctx, win);
+      if (!ctx.live()) return fail("cancelled");
+      if (!fr.front) return fail(`I could not bring "${short(win.title)}" to the front.`);
+      const wrect = p.windowRect?.(win.hwnd) ?? undefined;
+      const ui = await ctx.d.uiAgent.read(win.hwnd);
+      if (!ctx.live()) return fail("cancelled");
+      if (!ui.ok) return fail(`Could not look inside "${short(win.title)}" (${ui.reason}).`);
+      const src = pickControl(win, ui.items, String(a.from), { rid: a._fr as string | undefined, box: a._fb as string | undefined }, { rid: "_fr", box: "_fb" }, "item");
+      if ("out" in src) return src.out;
+      let tui: Awaited<ReturnType<typeof ctx.d.uiAgent.read>> = ui;
+      if (twin.hwnd !== win.hwnd) { tui = await ctx.d.uiAgent.read(twin.hwnd); if (!ctx.live()) return fail("cancelled"); if (!tui.ok) return fail(`Could not look inside "${short(twin.title)}" (${tui.reason}).`); }
+      const dst = pickControl(twin, tui.items, String(a.to), { rid: a._tr as string | undefined, box: a._tb as string | undefined }, { rid: "_tr", box: "_tb" }, "drop target");
+      if ("out" in dst) return dst.out;
+      if (twin.hwnd === win.hwnd && boxKey(src.node) === boxKey(dst.node)) return fail("The item and the place to drop it are the same thing.");
+      const from = center(src.node.rect!), to = center(dst.node.rect!);
+      const wins0 = await titlesNow(ctx);
+      await aimAt(ctx, src.node.rect!, src.node.name, `Picking up “${short(src.node.name, 36)}”`, "list_item");
+      if (!ctx.live()) return fail("cancelled");
+      const res = await retryCovered(ctx, win, () => p.drag!(from, to, { ms: glideMs(ctx), expectRoot: win.hwnd, expectWindow: wrect ? { hwnd: win.hwnd, rect: wrect } : undefined, dropRoot: twin.hwnd, dropWindow: twin.hwnd, verifySource: targetCheck(ctx, win, src.node), verifyDrop: targetCheck(ctx, twin, dst.node) }));
+      if (!ctx.live()) return fail("cancelled");
+      const bad = mapStop(res);
+      if (bad) return bad;
+      ctx.d.emit({ type: "cursor.result", state: "verifying", text: "Checking…" });
+      const seen = await untilChanged(ctx, win, ui.ok ? ui.items : null, 2000, screenPrint, wins0);
+      if (seen.cancelled || !ctx.live()) return fail("cancelled");
+      const after = seen.after, wins1 = seen.wins1;
+      const nw = appeared(wins0, wins1);
+      const stillThere = after.ok && after.items.some((n) => !!n.rect && !n.offscreen && n.type === src.node.type && norm(n.name) === norm(src.node.name));
+      if (after.ok && !stillThere) return ok(`Dragged "${short(src.node.name, 50)}" onto "${short(dst.node.name, 50)}"; it is no longer where it was, so it was moved.${newWinNote(nw)}`, true, undefined, "The item moved");
+      if (nw.length) return ok(`Dragged "${short(src.node.name, 50)}" onto "${short(dst.node.name, 50)}" and Windows opened “${short(nw[0], 50)}”: it may be asking something. Look at the screen.`, false);
+      return ok(`Dragged "${short(src.node.name, 50)}" onto "${short(dst.node.name, 50)}", but it is still listed where it was (it may have been copied, or the drop was refused), so I cannot confirm it moved.`, false);
+    },
+  });
+
+  // ---- keyboard shortcuts
+  const KEYS_REFUSED = /^(win\+l|win\+r|win\+x|ctrl\+alt\+delete|ctrl\+shift\+esc|alt\+tab)$/;
+  const KEYS_ASK = /^(alt\+f4|ctrl\+w|ctrl\+q|delete|shift\+delete|ctrl\+x|ctrl\+v|ctrl\+s|ctrl\+shift\+s|ctrl\+p|ctrl\+enter|enter|ctrl\+shift\+delete|ctrl\+z|ctrl\+y|ctrl\+shift\+n)$/;
+  const keysNorm = (k: unknown): string => String(k ?? "").toLowerCase().replace(/\s+/g, "");
+  add({
+    name: "press_keys", signature: "press_keys({keys, window?})",
+    description: "Press a keyboard shortcut in a window with the real keyboard, e.g. \"ctrl+f\" (find), \"ctrl+l\" (address bar), \"ctrl+a\", \"ctrl+c\", \"f5\", \"tab\", \"esc\", \"pagedown\", \"alt+left\", \"ctrl+t\". Shortcuts that send, delete, paste, save or close ask the user first; locking the PC, the Run box and Alt+Tab are refused. For typing words use type_text; for Enter in a field use press_enter. Needs Human-like control.",
+    sensitive: false, risk: (a) => (KEYS_ASK.test(keysNorm(a.keys)) ? "consequential" : "reversible"),
+    schema: z.object({ keys: z.string().trim().min(1).max(40), window: winArg, _hwnd: z.number().int().optional() }).strict(),
+    describe: (a) => `Press ${keysNorm(a.keys)}${a.window ? ` in “${short(String(a.window), 40)}”` : ""}? This might change or close something.`,
+    working: (a) => `Pressing ${keysNorm(a.keys)}…`,
+    async run(a, ctx) {
+      const keys = keysNorm(a.keys);
+      if (KEYS_REFUSED.test(keys)) return fail(`I will not press ${keys}: it could lock the PC, open the Run box or leave the window.`);
+      const p = humanPointer(ctx);
+      if (!p) return fail(NEEDS_HUMAN);
+      const found = await windowFor(ctx, a as { window?: string; _hwnd?: number });
+      if ("out" in found) return found.out;
+      if (!found.win) return fail("That window is gone.");
+      const win = found.win;
+      const fr = await bringToFront(ctx, win);
+      if (!ctx.live()) return fail("cancelled");
+      if (!fr.front) return fail(`I could not bring "${short(win.title)}" to the front.`);
+      // a password field with the cursor in it: no key goes there
+      const ui = await ctx.d.uiAgent.read(win.hwnd);
+      if (!ctx.live()) return fail("cancelled");
+      if (ui.ok && (ui.passwordFocused || ui.items.some((n) => n.focused && n.password))) return fail("The cursor is in a password field, so I pressed nothing.");
+      const wins0 = await titlesNow(ctx);
+      const rect = p.windowRect?.(win.hwnd);
+      if (rect) await aimAt(ctx, { l: rect.l + rect.w / 2 - 60, t: rect.t + 4, w: 120, h: 32 }, win.title, `Pressing ${keys}`);
+      if (!ctx.live()) return fail("cancelled");
+      const res = await p.press(keys, { expectForeground: win.hwnd });
+      if (!ctx.live()) return fail("cancelled");
+      const bad = mapStop(res);
+      if (bad) return bad;
+      ctx.d.emit({ type: "cursor.result", state: "verifying", text: "Checking…" });
+      const seen = await untilChanged(ctx, win, ui.ok ? ui.items : null, 1500, screenPrint, wins0);
+      if (seen.cancelled || !ctx.live()) return fail("cancelled");
+      const after = seen.after, wins1 = seen.wins1;
+      const nw = appeared(wins0, wins1);
+      const gone = wins0.has(win.hwnd) && !wins1.has(win.hwnd);
+      const changed = (ui.ok && after.ok && screenPrint(ui.items) !== screenPrint(after.items)) || nw.length > 0 || gone;
+      return changed
+        ? ok(`Pressed ${keys} in "${short(win.title)}" and the screen changed.${newWinNote(nw)}${gone ? " The window closed." : ""}`, true, undefined, "The screen changed")
+        : ok(`Pressed ${keys} in "${short(win.title)}", but nothing visibly changed, so I cannot confirm it did anything.`, false);
+    },
+  });
+
+  // ---- text selection
+  add({
+    name: "select_text", signature: "select_text({label, scope: \"all\"|\"word\", window?})",
+    description: "Select text in a named field or item with the real mouse and keyboard: scope \"all\" clicks into the field and presses Ctrl+A; scope \"word\" double-clicks it. After it, the user can copy or replace what is selected. Never in password fields. Needs Human-like control.",
+    sensitive: false, risk: "reversible",
+    schema: z.object({ label: winLabel, scope: z.enum(["all", "word"]), window: winArg, _hwnd: z.number().int().optional(), _rid: z.string().max(200).optional(), _box: z.string().max(60).optional() }).strict(),
+    describe: (a) => `Select ${a.scope === "all" ? "all the text" : "the word"} in “${short(String(a.label), 50)}”?`,
+    working: () => "Selecting the text…",
+    async run(a, ctx) {
+      const p = humanPointer(ctx);
+      if (!p) return fail(NEEDS_HUMAN);
+      const found = await windowFor(ctx, a as { window?: string; _hwnd?: number });
+      if ("out" in found) return found.out;
+      if (!found.win) return fail("That window is gone.");
+      const win = found.win;
+      await lookAround(ctx, win); if (!ctx.live()) return fail("cancelled");
+      const ui = await ctx.d.uiAgent.read(win.hwnd);
+      if (!ctx.live()) return fail("cancelled");
+      if (!ui.ok) return fail(`Could not look inside "${short(win.title)}" (${ui.reason}).`);
+      const pick = pickControl(win, ui.items, String(a.label), { rid: a._rid as string | undefined, box: a._box as string | undefined }, { rid: "_rid", box: "_box" }, "field");
+      if ("out" in pick) return pick.out;
+      if (pick.node.password) return fail("I never select text in password fields.");
+      const h = await humanClick(ctx, win, pick.node, "select", { double: a.scope === "word", u: know(win, pick.node, ui.items) });
+      if (!h.done) return fail(h.stop ?? `I could not click into "${short(pick.node.name, 40)}" with the mouse.`);
+      if (a.scope === "all") {
+        const k = await p.press("ctrl+a", { expectForeground: win.hwnd });
+        if (!ctx.live()) return fail("cancelled");
+        const bad = mapStop(k);
+        if (bad) return bad;
+      }
+      const after = await ctx.d.uiAgent.read(win.hwnd);
+      if (!ctx.live()) return fail("cancelled");
+      const here = after.ok ? after.items.find((n) => sameNode(n, h.node)) : undefined;
+      // Windows does not report WHICH text is selected, only that the field has the cursor: that is all that can be confirmed
+      return here?.focused
+        ? ok(`Clicked into "${short(pick.node.name, 50)}" and ${a.scope === "all" ? "pressed Ctrl+A" : "double-clicked a word"}. Windows confirms the field has the cursor, but it does not report what is selected, so look at the screen to be sure.`, false)
+        : ok(`Clicked "${short(pick.node.name, 50)}", but I cannot confirm the field has the cursor.`, false);
+    },
+  });
+
+  // ---- window position and size
+  const SNAP: Record<string, { keys: string; word: string }> = { left: { keys: "win+left", word: "snapped to the left half" }, right: { keys: "win+right", word: "snapped to the right half" }, maximize: { keys: "win+up", word: "maximized" }, restore: { keys: "win+down", word: "restored to its normal size" } };
+  add({
+    name: "arrange_window", signature: "arrange_window({to: \"left\"|\"right\"|\"maximize\"|\"restore\", window?})",
+    description: "Move and resize a window the way a person does with the keyboard: snap it to the left or right half of the screen, maximize it, or restore its size. Checks where the window really ended up. Needs Human-like control.",
+    sensitive: false, risk: "reversible",
+    schema: z.object({ to: z.enum(["left", "right", "maximize", "restore"]), window: winArg, _hwnd: z.number().int().optional() }).strict(),
+    describe: (a) => `${a.to === "maximize" ? "Maximize" : a.to === "restore" ? "Restore" : "Snap"} ${a.window ? `“${short(String(a.window), 40)}”` : "the window you were in"}?`,
+    working: () => "Arranging the window…",
+    async run(a, ctx) {
+      const p = humanPointer(ctx);
+      if (!p?.windowRect) return fail(NEEDS_HUMAN);
+      const found = await windowFor(ctx, a as { window?: string; _hwnd?: number });
+      if ("out" in found) return found.out;
+      if (!found.win) return fail("That window is gone.");
+      const win = found.win;
+      const fr = await bringToFront(ctx, win);
+      if (!ctx.live()) return fail("cancelled");
+      if (!fr.front) return fail(`I could not bring "${short(win.title)}" to the front.`);
+      const before = p.windowRect(win.hwnd);
+      const s = SNAP[String(a.to)];
+      if (before) await aimAt(ctx, { l: before.l + before.w / 2 - 60, t: before.t + 4, w: 120, h: 32 }, win.title, `Pressing ${s.keys}`);
+      if (!ctx.live()) return fail("cancelled");
+      const res = await p.press(s.keys, { expectForeground: win.hwnd });
+      if (!ctx.live()) return fail("cancelled");
+      const bad = mapStop(res);
+      if (bad) return bad;
+      // wait until the window has moved and stopped (snap animations take a moment), not a fixed pause
+      let lastKey = "";
+      const snapped = await until(ctx, async () => {
+        const r = p.windowRect?.(win.hwnd);
+        if (!r) return false;
+        const key = `${r.l},${r.t},${r.w},${r.h}`;
+        const moved0 = !!before && (Math.abs(before.l - r.l) > 8 || Math.abs(before.t - r.t) > 8 || Math.abs(before.w - r.w) > 8 || Math.abs(before.h - r.h) > 8);
+        const still = key === lastKey;
+        lastKey = key;
+        return moved0 && still;
+      }, { timeoutMs: 1500, win: win.hwnd, pollMs: 100 });
+      if (snapped.cancelled || !ctx.live()) return fail("cancelled");
+      const after = p.windowRect(win.hwnd);
+      // Win+Down on a window that is not maximized MINIMIZES it: a rectangle that "changed" is not proof it went where it was asked to
+      const st = await ctx.d.actionAgent.state(win.hwnd);
+      if (!ctx.live()) return fail("cancelled");
+      if (st.minimized) {
+        await ctx.d.actionAgent.focusWindow({ hwnd: win.hwnd, pid: win.pid }); // put it back: that is not what was asked for
+        return ok(`Pressed ${s.keys}, but that minimized "${short(win.title)}" (it was probably not maximized), so it was not ${s.word}. I brought it back.`, false);
+      }
+      const moved = !!before && !!after && (Math.abs(before.l - after.l) > 8 || Math.abs(before.t - after.t) > 8 || Math.abs(before.w - after.w) > 8 || Math.abs(before.h - after.h) > 8);
+      return moved
+        ? ok(`"${short(win.title)}" was ${s.word}: its position and size changed (${before!.w}×${before!.h} → ${after!.w}×${after!.h}).`, true, undefined, `Window ${s.word}`)
+        : ok(`Pressed ${s.keys}, but "${short(win.title)}" is where it was (it may already be like that), so I cannot confirm it changed.`, false);
+    },
+  });
+
+  // ---- the OCR fallback: a control UI Automation cannot name
+  add({
+    name: "click_text", signature: "click_text({text, window?})",
+    description: "Fallback for something visible on screen that click_control cannot find because the app does not expose it to Windows (a canvas, a custom-drawn app, an image button with a caption): read the screen's words with the local OCR, find the exact words, and click them with the real mouse. Use it only AFTER click_control said it found no such control. Clicks on words like Send, Delete, Pay ask the user first. Needs Human-like control.",
+    sensitive: false, risk: (a) => classifyControlRisk(String(a.text ?? "")),
+    schema: z.object({ text: winLabel, window: winArg, at: z.string().regex(/^-?\d{1,5},-?\d{1,5}$/).optional(), _hwnd: z.number().int().optional() }).strict(),
+    describe: (a) => `Click the words “${short(String(a.text), 50)}” on screen?${classifyControlRisk(String(a.text)) === "consequential" ? " This might not be undoable." : ""}`,
+    working: (a) => `Looking for the words “${short(String(a.text), 40)}”…`,
+    async run(a, ctx) {
+      const p = humanPointer(ctx);
+      if (!p) return fail(NEEDS_HUMAN);
+      const found = await windowFor(ctx, a as { window?: string; _hwnd?: number });
+      if ("out" in found) return found.out;
+      if (!found.win) return fail("That window is gone.");
+      const win = found.win;
+      const fr = await bringToFront(ctx, win);
+      if (!ctx.live()) return fail("cancelled");
+      if (!fr.front) return fail(`I could not bring "${short(win.title)}" to the front.`);
+      const wrect = p.windowRect?.(win.hwnd) ?? undefined;
+      const before = await ctx.d.uiAgent.read(win.hwnd);
+      if (before.ok && (before.passwordFocused || before.items.some((n) => n.password && n.focused))) return fail("The cursor is in a password field, so I clicked nothing.");
+      // fresh every time: where the words are NOW, never where they were
+      const w = await ctx.d.visualAgent.words(win.hwnd);
+      if (!ctx.live()) return fail("cancelled");
+      if (!w.ok) return fail(`I could not read the words on screen (${w.reason}).`);
+      const want = norm(String(a.text)).split(" ").filter(Boolean);
+      type Hit = { rect: { l: number; t: number; w: number; h: number }; text: string };
+      const hits: Hit[] = [];
+      for (let i = 0; i + want.length <= w.words.length; i++) {
+        const run = w.words.slice(i, i + want.length);
+        if (run.every((x, k) => norm(x.text) === want[k])) {
+          const l = Math.min(...run.map((x) => x.rect.l)), t = Math.min(...run.map((x) => x.rect.t));
+          hits.push({ rect: { l, t, w: Math.max(...run.map((x) => x.rect.l + x.rect.w)) - l, h: Math.max(...run.map((x) => x.rect.t + x.rect.h)) - t }, text: run.map((x) => x.text).join(" ") });
+        }
+      }
+      let chosen = hits;
+      if (a.at) { const [ax, ay] = String(a.at).split(",").map(Number); chosen = hits.filter((h) => Math.abs(center(h.rect).x - ax) <= 6 && Math.abs(center(h.rect).y - ay) <= 6); }
+      if (chosen.length === 0) return fail(`I could not see the words "${short(String(a.text), 40)}" on screen in "${short(win.title)}".`);
+      if (chosen.length > 1) {
+        const opts = chosen.slice(0, 6);
+        return { ok: false, ambiguous: { noun: "places where those words appear", labels: opts.map((h) => short(h.text, 40)), details: opts.map((h) => `at ${Math.round(h.rect.l)}, ${Math.round(h.rect.t)}`), patches: opts.map((h) => ({ _hwnd: win.hwnd, at: `${center(h.rect).x},${center(h.rect).y}` })) } };
+      }
+      const hit = chosen[0];
+      const wins0 = await titlesNow(ctx);
+      await aimAt(ctx, hit.rect, hit.text, `Clicking the words “${short(hit.text, 36)}” (read from the screen)`, "button");
+      if (!ctx.live()) return fail("cancelled");
+      const at = center(hit.rect);
+      const res = await retryCovered(ctx, win, () => p.click(at.x, at.y, { ms: glideMs(ctx), expectRoot: win.hwnd, expectWindow: wrect ? { hwnd: win.hwnd, rect: wrect } : undefined }));
+      if (!ctx.live()) return fail("cancelled");
+      const bad = mapStop(res);
+      if (bad) return bad;
+      ctx.d.emit({ type: "cursor.result", state: "verifying", text: "Checking…" });
+      const seen = await untilChanged(ctx, win, before.ok ? before.items : null, 1500, screenPrint, wins0);
+      if (seen.cancelled || !ctx.live()) return fail("cancelled");
+      const after = seen.after, wins1 = seen.wins1;
+      const nw = appeared(wins0, wins1);
+      const changed = (before.ok && after.ok && screenPrint(before.items) !== screenPrint(after.items)) || nw.length > 0;
+      return changed
+        ? ok(`Clicked the words "${short(hit.text, 50)}" (found by reading the screen) and the screen changed.${newWinNote(nw)}`, true, undefined, "The screen changed")
+        : ok(`Clicked the words "${short(hit.text, 50)}" (found by reading the screen), but nothing visibly changed, so I cannot confirm it worked.`, false);
     },
   });
 
@@ -1142,14 +1652,12 @@ export function buildTools(): ToolDef[] {
       if (!clickedTaskbar) await demoOpenApp(ctx, app.name); // otherwise the ghost shows how a person would start it
       if (!ctx.live()) return fail("cancelled");
       if (clickedTaskbar) { // did the click start it? (a window of that app that was not there before)
-        const sleep0 = sleeper(ctx);
-        for (let i = 0; i < attempts(ctx, 3); i++) {
-          await sleep0(1000);
-          if (!ctx.live()) return fail("cancelled");
+        const up0 = await until(ctx, async () => {
           const snap = await ctx.d.desktopAgent.snapshot();
-          if (!ctx.live()) return fail("cancelled");
-          if (ctx.d.verifier.appWindow(snap, before, app.name).verified) return ok(`Opened ${app.name} by clicking its icon on the taskbar; its window is showing.`, true);
-        }
+          return ctx.live() && ctx.d.verifier.appWindow(snap, before, app.name).verified;
+        }, { timeoutMs: attempts(ctx, 3) * 1000, pollMs: 300 });
+        if (up0.cancelled || !ctx.live()) return fail("cancelled");
+        if (up0.value) return ok(`Opened ${app.name} by clicking its icon on the taskbar; its window is showing.`, true);
         // the click did nothing: start it the normal way instead
       }
       const r = profile || site ? await ctx.d.appAgent.openProfile(app, profile?.dir ?? null, site?.url) : await ctx.d.appAgent.launchApp(app);
@@ -1163,14 +1671,12 @@ export function buildTools(): ToolDef[] {
         if (shown) await demoAddressBar(ctx, site.host); // then the address bar, as a person would
         return shown ? ok(`Opened ${site.host} in ${shown}${who}; the browser is showing it.`, true) : ok(`Opened ${app.name}${who} for ${site.host}, but the page could not be confirmed.`, false);
       }
-      const sleep = sleeper(ctx);
-      for (let i = 0; i < attempts(ctx, 5); i++) { // Store apps can take 10+ seconds to show their first window
-        await sleep(1000);
-        if (!ctx.live()) return fail("cancelled");
+      const up = await until(ctx, async () => { // Store apps can take 10+ seconds to show their first window: the wait ends the moment one appears
         const snap = await ctx.d.desktopAgent.snapshot();
-        if (!ctx.live()) return fail("cancelled");
-        if (ctx.d.verifier.appWindow(snap, before, app.name).verified) return ok(`${backgroundOf ? `${app.name} was already running in the background (no window), so I asked Windows to bring it up. ` : ""}Opened ${app.name}${who}; its window is showing.`, true);
-      }
+        return ctx.live() && ctx.d.verifier.appWindow(snap, before, app.name).verified;
+      }, { timeoutMs: attempts(ctx, 5) * 1000, pollMs: 300 });
+      if (up.cancelled || !ctx.live()) return fail("cancelled");
+      if (up.value) return ok(`${backgroundOf ? `${app.name} was already running in the background (no window), so I asked Windows to bring it up. ` : ""}Opened ${app.name}${who}; its window is showing.`, true);
       return ok(`Asked Windows to start ${app.name}${who}, but no window appeared yet.`, false);
     },
   });

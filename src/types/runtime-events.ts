@@ -70,7 +70,7 @@ export const RuntimeEventSchema = z.discriminatedUnion("type", [
   z.object({
     type: z.literal("cursor.window"),
     hwnd: z.number().int().positive(),
-    action: z.enum(["focus", "minimize", "close", "open"]),
+    action: z.enum(["focus", "minimize", "close", "open", "look"]),
     label: z.string().max(80).optional(),
   }),
   z.object({ type: z.literal("runtime.error"), code: z.string().min(1).max(64), message: text }),

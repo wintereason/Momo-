@@ -62,6 +62,24 @@ export default function BarApp() {
 
   const send = useCallback((e: BarEvent) => dispatch(e), []);
 
+  // how wide the avatar is really drawn (the speech cloud sits right next to it), and whether the pointer is over it: then it turns see-through so
+  // what is under it on the screen can be seen (the bar is click-through, so the click already reaches that window)
+  const [artRight, setArtRight] = useState(0); // where the drawn avatar ends, measured from the dock's left edge
+  const [peek, setPeek] = useState(false);
+  useEffect(() => {
+    const over = (e: MouseEvent) => {
+      const el = document.querySelector(".dock"); if (!el) return setPeek(false);
+      const r = el.getBoundingClientRect(), toggle = document.querySelector(".dock-toggle")?.getBoundingClientRect();
+      const inDock = e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
+      const onToggle = !!toggle && e.clientX >= toggle.left && e.clientX <= toggle.right && e.clientY >= toggle.top && e.clientY <= toggle.bottom;
+      setPeek(inDock && !onToggle);
+    };
+    const leave = () => setPeek(false);
+    window.addEventListener("mousemove", over);
+    document.documentElement.addEventListener("mouseleave", leave);
+    return () => { window.removeEventListener("mousemove", over); document.documentElement.removeEventListener("mouseleave", leave); };
+  }, []);
+
   // a speech model that is already on this PC counts as agreed to
   const cachedRef = useRef(false);
   useEffect(() => {
@@ -317,9 +335,9 @@ export default function BarApp() {
         </div>
       )}
       {ch.enabled && (
-        <div className={`dock ${ch.view}${isSpriteArt(ch.art) ? " has-art" : ""}`}>
+        <div className={`dock ${ch.view}${isSpriteArt(ch.art) ? " has-art" : ""}${peek ? " peek" : ""}`} style={artRight ? ({ "--art-right": `${artRight}px` } as React.CSSProperties) : undefined}>
           {isSpriteArt(ch.art)
-            ? <AvatarView character={ch} expression={expression} view={ch.view} mouth={mouth} className="dock-art" />
+            ? <AvatarView character={ch} expression={expression} view={ch.view} mouth={mouth} className="dock-art" onBox={() => { const dock = document.querySelector(".dock"), img = document.querySelector(".dock .avatar-base"); if (dock && img) setArtRight(Math.round(img.getBoundingClientRect().right - dock.getBoundingClientRect().left)); }} />
             : <Momo appearance={ch} expression={expression} mouth={mouth} view={ch.view} className="dock-svg" />}
           <SpeechCloud cloud={spoken.cloud} />
           <button data-hit className="dock-toggle" onClick={toggleView} aria-label={ch.view === "compact" ? "Expand Momo" : "Shrink Momo"} title={ch.view === "compact" ? "Expand" : "Shrink"}>{ch.view === "compact" ? "⤢" : "⤡"}</button>

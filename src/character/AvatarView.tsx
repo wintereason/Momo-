@@ -48,12 +48,14 @@ export function surpriseLevel(t: number): number {
 const mask = (r: Region, core = 55) => (Array.isArray(r.cx) ? r.cx : [r.cx]).map((cx) => `radial-gradient(ellipse ${r.rx * 100}% ${r.ry * 100}% at ${cx * 100}% ${r.cy * 100}%, #000 ${core}%, transparent 100%)`).join(", ");
 const GLYPH_COLOR = { accent: "#ffd1e1", warn: "#ffb83d", bad: "#ff5c7a", soft: "#bfe3ff" } as const;
 
-export function AvatarView({ character, expression, view, mouth, className }: {
+export function AvatarView({ character, expression, view, mouth, className, onBox }: {
   character: CharacterPrefs;
   expression: ExpressionId;
   view: View;
   mouth?: MouthSync | null;
   className?: string;
+  /** told how wide the figure is actually drawn (px), so things beside it (the speech cloud) can sit right next to it */
+  onBox?: (b: { w: number; h: number }) => void;
 }) {
   const art = isSpriteArt(character.art) ? character.art : null;
   const uid = useId().replace(/[^a-zA-Z0-9]/g, "");
@@ -71,7 +73,13 @@ export function AvatarView({ character, expression, view, mouth, className }: {
     setRoom({ w: el.clientWidth, h: el.clientHeight });
     return () => ro.disconnect();
   }, []);
-  const fit = room && nat && room.w > 0 && room.h > 0 ? (() => { const s = Math.min(room.w / nat.w, room.h / nat.h, 1); return { w: nat.w * s, h: nat.h * s }; })() : null;
+  const fit = room && nat && room.w > 0 && room.h > 0 ? (() => { const s = Math.min(room.w / nat.w, room.h / nat.h, 1) * (art ? AVATARS[art].displayScale ?? 1 : 1); return { w: nat.w * s, h: nat.h * s }; })() : null;
+  const boxCb = useRef(onBox); boxCb.current = onBox;
+  // the width the figure is really drawn at (the picture's own box, which the CSS may clamp below the fitted size)
+  useEffect(() => {
+    const id = window.requestAnimationFrame(() => { const img = refs.current.rig?.querySelector<HTMLElement>(".avatar-base"); if (img && img.offsetWidth > 0) boxCb.current?.({ w: img.offsetWidth, h: img.offsetHeight }); });
+    return () => window.cancelAnimationFrame(id);
+  }, [fit?.w, fit?.h, view, art]); // eslint-disable-line react-hooks/exhaustive-deps
   const sreg = (k: string) => (el: SVGElement | null) => { svgs.current[k] = el; };
   // the surprise settles back to normal on its own after a few seconds (see SURPRISE_*)
   const [settled, setSettled] = useState(false);

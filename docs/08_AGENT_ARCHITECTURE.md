@@ -140,3 +140,54 @@ Events: `cursor.aim` (the exact element's box, with what it is for, BEFORE anyth
 * **The user always wins:** while a task is armed, a watchdog notices the physical mouse moving away from where Momo left it, or Esc, during the glide, while typing and BETWEEN steps; then the whole task is cancelled (not just the click), the ghost shows "Stopped: you moved the mouse / pressed Esc", nothing later (not even the task's own ending) overrides that, and the bar is told. It is disarmed while Momo waits for your answer, so clicking Confirm is not a takeover.
 * **Changing windows:** the window's box is captured before the controls are read; the pointer refuses to press if the window has moved (and re-reads and re-aims once). A covered target is refused; DPI/multi-monitor: positions are physical pixels converted per display; the overlay raises itself above always-on-top windows on each aim, press and result.
 * Evidence: `scripts/live-apps.cjs` (real Calculator, Explorer, Notepad windows), `scripts/live-cursor-sync.cjs` (real overlay + real pointer + real input, with takeover latency), `scripts/live-understand-act.cjs` (real tools on a real Explorer window).
+
+## Real mouse and keyboard, and how Momo checks the screen (interaction upgrade)
+
+One cycle for every action on the desktop: **observe → understand → plan → validate → move → act → observe again → verify.** Nothing here is a separate automation system: the tools below are ordinary orchestrator tools (`src/runtime-core/orchestrator/tools.ts`) that use the same UI Agent (UI Automation first, local OCR as the fallback), Action Agent, World Model and shadow cursor, and the same `PointerPort` (`electron/humanInput.cjs`).
+
+- **Look before acting.** Tools that act on a control first glance at the visible windows and settle on the target window (`lookAround`, a `cursor.window` "look" event), then read that window fresh. Simple actions do not scan; the glance is only a show for the shadow cursor and costs nothing when it is off.
+- **Tools (Human-like control on):** `scroll_window`, `right_click`, `drag_drop` (always asks first), `press_keys` (shortcuts; Win+L, Win+R, Win+X, Ctrl+Alt+Del, Ctrl+Shift+Esc and Alt+Tab are refused; closing / deleting / pasting / saving / sending shortcuts ask first), `select_text` (all / word), `arrange_window` (snap left/right, maximize, restore, via Win+arrow keys), `click_text` (the OCR fallback: reads the words on the window with their screen boxes and clicks the exact words, only after `click_control` found no such control). Existing tools (`click_control` incl. double-click, `type_text`, `select_field`, `press_enter`, window tools) are unchanged.
+- **No stale coordinates.** Controls and OCR words are read fresh for every action; the click is refused if the window moved or something else is on top of the spot (`expectRoot` / `expectWindow`), then read again once. `isFront` now also asks Windows which window is really on top, not only which program owns the foreground.
+- **Verification.** Each tool reads the screen again and says "verified" only when the second look shows it (a menu appeared, a new window opened, the item left the list, the window's rectangle changed, the field read back). Otherwise it reports "could not confirm". A new window appearing after an action (dialog, menu) is part of the evidence and is mentioned.
+- **Safety.** Show Only and Human-like control stay separate modes (the new tools need the real pointer and say so when it is off). Esc or moving the real mouse stops everything at once, a held mouse button is always released, and Momo's own Esc keystroke is ignored by the watchdog for half a second. No key or click goes to a password field (`UiReadResult.passwordFocused`).
+- **Limits (honest):** Windows does not report which text is selected, so `select_text` can confirm only that the field has the cursor. Window snapping uses the keyboard, not dragging the title bar or edges. OCR needs a Windows language pack and cannot read text a program draws outside its window capture.
+
+### Observation helper (interaction upgrade, phase 1)
+
+`src/runtime-core/shared/uiaHelper.ts` keeps ONE long-lived Windows PowerShell 5.1 host running (compiled C# inside, nothing to install) and answers UI Automation reads and window lists over stdin/stdout. It is only an accelerator: if it is off (`MOMO_UIA_HELPER=0`), still starting, crashes, hangs (20 s) or cannot start (a 60 s cool-off), the same answer comes from the old one-shot script, and the helper restarts later. Measured on a real PC (steady state): window list ~900 ms → ~6 ms; Settings read ~2.2 s → ~0.25 s; Explorer ~2.0 s → ~0.3-0.45 s; Orca ~2.8 s → ~0.4 s; Chrome ~4.8 s → ~1.0 s.
+
+- Launched as `-File` from a content-hashed copy in the per-user temp folder (`%TEMP%\momo-helper\uia-<hash>.ps1`): a base64 "Invoke-Expression" launcher was refused by Windows Defender (spawn EPERM), and the script exceeds the 32 KB command-line limit. The file is rewritten if its content is not exactly ours. It contains no network or file-writing code (tested).
+- Same walker as before (`ControlViewWalker`), with each element's properties fetched in one batched call. Same fields, same caps. It returns a **superset** of the old reader on some windows (Explorer's real navigation tree instead of a "Navigation Pane" stub; caption buttons on Settings/Firefox). Elements with no control type (Explorer's toolbars) get an empty type, never dropped.
+- Never keeps its parent alive (handles are unref'd) and exits when its stdin closes or after 5 idle minutes. Started in the background when the runtime is created (`uiaHost.warm()`); its first start compiles for about a second.
+
+## Change detection instead of fixed pauses (phase 2)
+
+Before, every verified action ended with a fixed sleep (400-1000 ms) and then one look. Now it ends with a **timed condition wait**: look
+at once, and look again when Windows reports a change, until the effect shows or a time limit passes.
+
+**Event source.** The Phase 1 helper also runs a `MomoEvents` thread: three out-of-context `SetWinEventHook`s (foreground, menu/dialog/scroll/
+minimize/move, window create/destroy/show/hide, focus, selection, state/name/value changes) feeding a message loop. It pushes `@@!E {n, e:[[kind, rootHwnd]...]}`
+lines, coalesced every 40 ms. Only a kind and a window handle: never titles, text, pixels or UI trees; windows that are parts of other windows,
+the mouse cursor and the caret are dropped. Nothing is written anywhere; Node keeps the last 64 batches in memory.
+
+**Lifecycle.** Events are off until something waits (`acquire()` sends `events on`) and are switched off 10 s after the last wait ends (`events off`).
+A helper restart, crash, timeout or idle stop sets events to "not healthy" and nothing pretends they are still on.
+
+**Health = heartbeat.** About once a second the timer posts a message to the hook thread's message loop; only if the loop answers is `@@!H`
+sent. Without a recent heartbeat (3.5 s) `healthy()` is false and waits poll. A batch that overflowed is reported as a `many` change, not silence.
+
+**`waitFor(check, {timeoutMs, pollMs, fallbackMs, source, relevant})`** (`shared/changeWatch.ts`). The caller's `check` (a real read of the screen) always decides;
+an event only says "look now". Healthy: wake on a relevant event (+40 ms settle), or on the fallback timer (250-600 ms) in case an event was lost; a change
+that lands while a look is running is looked at again at once. Unhealthy or no source or a source that throws: plain polling. Always: a hard timeout,
+reported as `timedOut`, never as success; cancel is honoured; the hook is released in `finally`. Time spent counts requested waits, so fake sleeps in tests cannot spin.
+
+**Use in the tools.** `until()` wraps it. Replaced fixed pauses: open file/folder/app/page, focus/minimize/close, bring-to-front (also waits for the window to stop moving
+before coordinates are used), taskbar launch, typing read-back, snap/arrange, and the "did the screen change" look after click, scroll, right-click, drag, keys and OCR click
+(`untilChanged`: a change counts once it has held still, judged by a quiet event stream when events are healthy, else by a second identical look). Not replaced: the
+shadow cursor's lead time (a show for the user, not a post-action delay).
+
+**Window state through the helper.** `InputPort.windowState` was a one-shot PowerShell (~0.9 s per look), which made every polled look slow. The helper now answers `state <hwnd>` in ~1 ms
+(the one-shot script remains the fallback).
+
+**Fixed on the way.** `arrange_window restore` pressed Win+Down on a window that was not maximized, which MINIMIZES it, and reported success because the rectangle changed. It now checks the real
+state, reports it as not done and brings the window back. Scroll is judged on nearly every visible control (not the first 40, which in a browser are the toolbar).

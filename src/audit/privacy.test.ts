@@ -41,7 +41,12 @@ const files = (h: { file: string }[]) => [...new Set(h.map((x) => x.file))].sort
 describe("what Momo writes to disk", () => {
   it("writes only preferences, the AI request counter, the online-voice character counter, and the speech-model cache", () => {
     const writes = hits(/\b(writeFile|writeFileSync|appendFile|appendFileSync|createWriteStream|localStorage\.setItem|\.setItem\(|sessionStorage|indexedDB|document\.cookie|openDatabase)\b/);
-    expect(files(writes)).toEqual(["electron/env.cjs", "electron/main.cjs", "src/learning/store.ts", "src/state/settings.ts"]);
+    expect(files(writes)).toEqual(["electron/env.cjs", "electron/main.cjs", "src/learning/store.ts", "src/runtime-core/shared/uiaHelper.ts", "src/state/settings.ts"]);
+    // src/runtime-core/shared/uiaHelper.ts: exactly one write: the observation helper's OWN source code (a fixed constant, no user data) as a
+    // content-hashed .ps1 in the per-user temp folder, because it is too long for a command line and a base64 launcher is blocked by Windows Defender
+    const helperWrites = writes.filter((w) => w.file === "src/runtime-core/shared/uiaHelper.ts");
+    expect(helperWrites).toHaveLength(1);
+    expect(helperWrites[0].line).toContain("fs.writeFileSync(file, script,");
     // electron/env.cjs: exactly one write, inside save(): the keys the user typed into Settings, into Momo's own .env
     const envWrites = writes.filter((w) => w.file === "electron/env.cjs");
     expect(envWrites).toHaveLength(1);
@@ -173,9 +178,10 @@ describe("what touches the network", () => {
 });
 
 describe("how programs are started", () => {
-  it("child processes are created in only three places, and never through a shell", () => {
+  it("child processes are created in only a few places, and never through a shell", () => {
     const spawns = hits(/\b(spawn|execFile|execFileSync|exec|execSync|fork)\(/);
-    expect(files(spawns)).toEqual(["src/runtime-core/apps/launchPorts.ts", "src/runtime-core/shared/nodePorts.ts"]);
+    // uiaHelper.ts: the long-lived local PowerShell host for UI Automation reads (fixed script file, no shell, no data in the command line)
+    expect(files(spawns)).toEqual(["src/runtime-core/apps/launchPorts.ts", "src/runtime-core/shared/nodePorts.ts", "src/runtime-core/shared/uiaHelper.ts"]);
     expect(hits(/shell\s*:\s*true/)).toEqual([]);
     expect(hits(/\b(exec|execSync)\(/)).toEqual([]); // exec() goes through a shell
   });

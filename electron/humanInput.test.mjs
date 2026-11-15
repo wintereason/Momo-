@@ -205,3 +205,76 @@ describe("typing", () => {
     expect(f.tracks.filter((t) => t.phase === "key").map((t) => t.ch).join("")).toBe("नमस्ते 😀");
   });
 });
+
+describe("right click, drag and scroll (the user always wins, and nothing is left held down)", () => {
+  const withButtons = () => {
+    const log = [];
+    const f = fake({ mouseDown: (right) => { log.push(right ? "down:right" : "down:left"); return true; }, mouseUp: (right) => { log.push(right ? "up:right" : "up:left"); }, wheel: (d) => { log.push("wheel:" + d); return true; } });
+    return { ...f, log };
+  };
+  it("a right click presses the RIGHT button once, even when double is asked", async () => {
+    const f = withButtons();
+    f.pointer.arm();
+    expect(await f.pointer.click(300, 300, { ms: 200, expectRoot: 7, button: "right", double: true })).toEqual({ ok: true });
+    expect(f.log).toEqual(["down:right", "up:right"]);
+  });
+  it("a drag presses, travels to the drop point, and lets go there", async () => {
+    const f = withButtons();
+    f.pointer.arm();
+    const r = await f.pointer.drag({ x: 200, y: 200 }, { x: 500, y: 400 }, { ms: 200, expectRoot: 7 });
+    expect(r).toEqual({ ok: true });
+    expect(f.log).toEqual(["down:left", "up:left"]);
+    expect({ x: f.st.x, y: f.st.y }).toEqual({ x: 500, y: 400 });
+  });
+  it("if the user grabs the mouse half-way through a drag, the button is STILL released and Momo stops", async () => {
+    const f = withButtons();
+    f.pointer.arm();
+    let n = 0;
+    f.st.onStep = (st) => { if (f.log.includes("down:left") && ++n === 5) st.x += 200; }; // the user yanks the mouse after the button went down
+    const r = await f.pointer.drag({ x: 200, y: 200 }, { x: 800, y: 500 }, { ms: 400, expectRoot: 7 });
+    expect(r.ok).toBe(false);
+    expect(f.log[f.log.length - 1]).toBe("up:left");
+    expect(f.interrupts).toEqual(["mouse"]);
+  });
+  it("a drag does not start when the target window is covered", async () => {
+    const f = withButtons();
+    f.pointer.arm();
+    f.st.root = 99;
+    expect(await f.pointer.drag({ x: 200, y: 200 }, { x: 500, y: 400 }, { ms: 200, expectRoot: 7 })).toEqual({ ok: false, reason: "covered" });
+    expect(f.log).toEqual([]);
+  });
+  it("scrolling down sends negative wheel notches, up positive, a few at a time", async () => {
+    const f = withButtons();
+    f.pointer.arm();
+    expect(await f.pointer.scroll(400, 300, 3, { ms: 200, expectRoot: 7 })).toEqual({ ok: true });
+    expect(f.log).toEqual(["wheel:-120", "wheel:-120", "wheel:-120"]);
+    f.log.length = 0;
+    await f.pointer.scroll(400, 300, -2, { ms: 200, expectRoot: 7 });
+    expect(f.log).toEqual(["wheel:120", "wheel:120"]);
+  });
+  it("Esc stops a scroll between notches", async () => {
+    const f = withButtons();
+    f.pointer.arm();
+    let seen = 0;
+    f.st.onStep = () => {};
+    const origWheel = f.log.push.bind(f.log);
+    f.log.push = (...a) => { seen++; if (seen === 2) f.st.esc = true; return origWheel(...a); };
+    const r = await f.pointer.scroll(400, 300, 10, { ms: 200, expectRoot: 7 });
+    expect(r).toEqual({ ok: false, reason: "stopped" });
+    expect(f.log.length).toBeLessThan(10);
+  });
+});
+
+describe("Momo's own Escape key is not mistaken for the user's", () => {
+  it("pressing esc does not stop the task, but a LATER real Esc from the user still does", async () => {
+    const f = fake({ keyDown: (vk) => { if (vk === 0x1b) f.st.esc = true; }, keyUp: (vk) => { if (vk === 0x1b) f.st.esc = false; } });
+    f.pointer.arm();
+    expect(await f.pointer.press("esc")).toEqual({ ok: true });
+    expect(f.interrupts).toEqual([]);
+    f.st.esc = false;
+    await new Promise((r) => setTimeout(r, 560));
+    f.st.esc = true; // the user, after Momo's own press is long over
+    expect(await f.pointer.click(300, 300, { ms: 200, expectRoot: 7 })).toEqual({ ok: false, reason: "stopped" });
+    expect(f.interrupts).toEqual(["esc"]);
+  });
+});

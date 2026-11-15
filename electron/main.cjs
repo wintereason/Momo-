@@ -229,11 +229,15 @@ function getPointer() {
       // the ghost sits exactly where the REAL pointer is, at every step, so the two can never drift apart
       onTrack: (t) => { try { getShadow().track(t); } catch { /* decoration */ } },
       // THE USER ALWAYS WINS: they moved the physical mouse or pressed Esc. Stop the whole task now, not just this click.
-      onInterrupt: (reason) => {
+      // (Momo's own held mouse buttons and keys were already let go of before this is called: see humanInput.cjs.)
+      onInterrupt: (reason, detail) => {
         try { getShadow().stop(reason); } catch { /* decoration */ }
         try { runtime?.cancelTask(); } catch { /* ignore */ }
         try { pointer?.disarm(); } catch { /* ignore */ }
-        if (lastTaskId) broadcast("momo:runtime-event", { type: "task.failed", taskId: lastTaskId, summary: reason === "esc" ? "Stopped: you pressed Esc." : "Stopped: you moved the mouse.", recoverable: true });
+        // say what was really noticed (mouse moved / wheel / click / keyboard / Esc); the detail itself stays in memory and is never logged
+        const cause = detail && typeof detail.cause === "string" ? detail.cause : "";
+        const what = reason === "esc" ? "you pressed Esc" : /wheel/.test(cause) ? "you used the mouse wheel" : /click|button held/.test(cause) ? "you used the mouse buttons" : /keyboard|modifier|key/.test(cause) ? "you used the keyboard" : "you moved the mouse";
+        if (lastTaskId) broadcast("momo:runtime-event", { type: "task.failed", taskId: lastTaskId, summary: `Stopped: ${what}.`, recoverable: true });
       },
     });
     if (taskWorking) pointer.arm();
@@ -307,7 +311,12 @@ ipcMain.on("momo:submit-transcript", (e, p) => {
   }
   void runtime.handleTranscript(p.sessionId.slice(0, 128), p.text.slice(0, 2000));
 });
-ipcMain.on("momo:cancel-task", (e) => { if (fromOurWindow(e)) { runtime?.cancelTask(); pointer?.disarm(); shadow?.cancel(); } });
+ipcMain.on("momo:cancel-task", (e) => {
+  if (!fromOurWindow(e)) return;
+  // Cancel reaches the real mouse and keyboard too: anything in flight stops at once and everything Momo holds is let go of (a drag is cancelled, not dropped)
+  try { pointer?.abort("cancel"); } catch { /* ignore */ }
+  runtime?.cancelTask(); pointer?.disarm(); shadow?.cancel();
+});
 // The Language Teacher (a specialist role of the runtime): the other side of a roleplay interview, one line per call. The runtime
 // validates the request and the AI's reply; the page keeps the conversation and the learner's progress.
 ipcMain.handle("momo:language-converse", async (e, req) => {
@@ -563,8 +572,21 @@ function applyShortcut(role, chord, m) {
 function sendShortcut(role, kind) {
   if (barWin && !barWin.isDestroyed()) barWin.webContents.send("momo:shortcut", { role, kind });
 }
+/**
+ * The takeover signals (Esc, a key, the wheel, a click) go to the pointer, which stops at once: events, so a short Esc tap is never missed the way polling can.
+ * PRIVACY: only the KIND of input is passed on (never which key, never where), nothing is stored, and the pointer ignores it unless a task is running
+ * and Momo itself has just used the mouse or keyboard. Keys of the voice shortcut do not count (they are how the user talks to Momo).
+ */
+function signalPointer(kind, code) {
+  if (!pointer) return;
+  if (kind === "key" && ROLES.some((role) => keys[role].tracker?.relevant?.has(code))) return;
+  try { pointer.userSignal(kind); } catch { /* the watchdog still polls */ }
+}
 function startKeyHook() {
+  uIOhook.on("wheel", () => signalPointer("wheel"));
+  uIOhook.on("mousedown", () => signalPointer("click"));
   uIOhook.on("keydown", (e) => {
+    signalPointer(e.keycode === UiohookKey.Escape ? "esc" : "key", e.keycode);
     for (const role of ROLES) {
       const r = keys[role].tracker?.down(e.keycode);
       if (r === "press") sendShortcut(role, "press"); // key-repeat ("repeat") is dropped here
@@ -593,7 +615,10 @@ ipcMain.handle("momo:shortcut-status", (e, role) => (fromOurWindow(e) && ROLES.i
 const allowedRequest = makeAllowedRequest(DEV_URL);
 
 // ---- A crash in one place must not take Momo down, and must not leak what the user was doing.
-process.on("uncaughtException", (err) => console.error("Momo recovered from an internal error:", err && err.message));
+process.on("uncaughtException", (err) => {
+  try { pointer?.releaseAll(); } catch { /* ignore */ } // the app carries on after an internal error: never with a button or key still held
+  console.error("Momo recovered from an internal error:", err && err.message);
+});
 process.on("unhandledRejection", (err) => console.error("Momo recovered from an internal error:", err && err.message));
 
 app.whenReady().then(() => {
@@ -638,6 +663,7 @@ app.on("second-instance", () => openSettings());
 app.on("window-all-closed", () => app.quit());
 // Session state lives only in memory and is discarded on exit.
 app.on("before-quit", () => {
+  try { pointer?.dispose(); } catch { /* ignore */ } // let go of any mouse button or key Momo holds, and never act again
   runtime?.dispose(); // explicit session cleanup: the world model and task state are discarded
   runtime = null;
   stt?.unload();

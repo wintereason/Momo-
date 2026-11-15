@@ -25,6 +25,8 @@ export interface AvatarDef {
   faces: Record<ExpressionId, AvatarCell>;
   /** symbols that replace the default one for an expression (the drawn pose may already carry it, e.g. sweat drops) */
   glyphs?: Partial<Record<ExpressionId, string>>;
+  /** how much of its box the figure fills (default 1). Below 1 it is drawn smaller, standing on the same ground line, which leaves room above the head */
+  displayScale?: number;
 }
 
 export const AVATARS: Record<SpriteArt, AvatarDef> = {

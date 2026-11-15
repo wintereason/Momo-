@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
-import type { CaptureResult, FsPort, OcrResult, RawWindow, ScreenPort, UiNode, UiReadResult, WindowsPort, WindowsSnapshot } from "./ports";
+import type { CaptureResult, ElementAtResult, FsPort, OcrResult, OcrWordsResult, RawWindow, ScreenPort, UiNode, UiReadResult, WindowsPort, WindowsSnapshot } from "./ports";
 
 const withTimeout = <T>(p: Promise<T>, ms: number, fallback: T): Promise<T> =>
   Promise.race([p, new Promise<T>((r) => setTimeout(() => r(fallback), ms))]);
@@ -69,6 +69,14 @@ export function runPowerShell<T>(script: string, timeoutMs: number, stdin?: stri
   });
 }
 
+import { UiaHost } from "./uiaHelper";
+
+/**
+ * The long-lived Windows helper (see uiaHelper.ts): observations through it take milliseconds instead of seconds. It only ever speeds things up:
+ * if it is off, still compiling, or fails, the same answer comes from the one-shot script below. MOMO_UIA_HELPER=0 turns it off.
+ */
+export const uiaHost = new UiaHost({ enabled: () => process.env.MOMO_UIA_HELPER !== "0" });
+
 // ------------------------------------------------------------------ windows
 
 const WINDOWS_SCRIPT = String.raw`
@@ -132,7 +140,9 @@ $procs = @($names.Values | ForEach-Object { ([string]$_).ToLower() } | Sort-Obje
 /** Real window listing through the Win32 API (via a short-lived PowerShell process). */
 export const nodeWindows: WindowsPort = {
   async query(): Promise<WindowsSnapshot> {
-    const raw = await runPowerShell<{ activePid?: number; activeHwnd?: number; windows?: RawWindow | RawWindow[]; procs?: string | string[] }>(WINDOWS_SCRIPT, 10_000);
+    type RawWins = { activePid?: number; activeHwnd?: number; windows?: RawWindow | RawWindow[]; procs?: string | string[] };
+    let raw: RawWins;
+    try { raw = await uiaHost.request<RawWins>("windows", 10_000); } catch { raw = await runPowerShell<RawWins>(WINDOWS_SCRIPT, 10_000); }
     const list = Array.isArray(raw.windows) ? raw.windows : raw.windows ? [raw.windows] : [];
     return {
       activePid: raw.activePid && raw.activePid > 0 ? raw.activePid : null,
@@ -348,6 +358,13 @@ public static class MomoCap {
 }
 `;
 
+// The same capture, but returning every WORD with its box on screen (the bitmap may have been scaled down to fit the engine).
+const WORDS_SCRIPT = OCR_SCRIPT.replace(`  $lines = @($res.Lines | ForEach-Object { [string]$_.Text })
+  [pscustomobject]@{ ok = $true; lines = $lines } | ConvertTo-Json -Compress -Depth 3`,
+`  $sc = $bmp.Width / $w
+  $words = @($res.Lines | ForEach-Object { $_.Words } | ForEach-Object { [pscustomobject]@{ t = [string]$_.Text; l = [int]($r.Left + $_.BoundingRect.X / $sc); y = [int]($r.Top + $_.BoundingRect.Y / $sc); w = [int]($_.BoundingRect.Width / $sc); h = [int]($_.BoundingRect.Height / $sc) } })
+  [pscustomobject]@{ ok = $true; words = $words } | ConvertTo-Json -Compress -Depth 4`);
+
 // The same capture as the OCR script, cropped to one box (small pictures are scaled up so the letters are big enough), as text OR as a PNG.
 const REGION_SCRIPT = OCR_SCRIPT
   .replace("  if (-not $ok) { Fail 'capture_failed' }", `  if (-not $ok) { Fail 'capture_failed' }
@@ -373,7 +390,7 @@ function parseRect(b: string | undefined): UiNode["rect"] {
 }
 
 interface RawUi { ok: boolean; error?: string; truncated?: boolean; items?: { t: string; n: string; e: boolean; o: boolean; v?: string | null; p?: boolean; r?: string; s?: string; ro?: boolean; f?: boolean; b?: string; pa?: string; id?: string; cl?: string; hp?: string; lb?: string; pt?: string; x?: string }[] }
-interface RawOcr { ok: boolean; error?: string; lines?: string[] | string; png?: string; w?: number; h?: number }
+interface RawOcr { words?: { t: string; l: number; y: number; w: number; h: number }[] | { t: string; l: number; y: number; w: number; h: number }; ok: boolean; error?: string; lines?: string[] | string; png?: string; w?: number; h?: number }
 const regionArg = (r: { l: number; t: number; w: number; h: number }): string | null =>
   [r.l, r.t, r.w, r.h].every((n) => Number.isFinite(n) && Math.abs(n) < 100_000) && r.w >= 4 && r.h >= 4 && r.w <= 1600 && r.h <= 1200 ? [r.l, r.t, r.w, r.h].map(Math.round).join(",") : null;
 
@@ -390,10 +407,21 @@ let taskbarCache: { at: number; items: UiNode[] } | null = null;
 
 /** Real window inspection: UI Automation for structure and text, capture + Windows OCR as the fallback. */
 export const nodeScreen: ScreenPort = {
+  /** the helper only (a one-shot script is far too slow for a last look before a click): when it cannot answer, the caller treats the target as unconfirmed */
+  async elementAt(x: number, y: number): Promise<ElementAtResult> {
+    if (!Number.isFinite(x) || !Number.isFinite(y) || Math.abs(x) > 100_000 || Math.abs(y) > 100_000) return { ok: false, reason: "invalid point" };
+    try {
+      const r = await uiaHost.request<{ ok: boolean; chain?: Array<{ r: string; t: string; n: string; p: boolean }> }>(`at ${Math.round(x)} ${Math.round(y)}`, 3000);
+      if (!r.ok || !r.chain) return { ok: false, reason: "nothing there" };
+      return { ok: true, chain: r.chain.map((c) => ({ rid: c.r, type: c.t, name: c.n, password: !!c.p })) };
+    } catch { return { ok: false, reason: "helper unavailable" }; }
+  },
   async readUi(hwnd: number): Promise<UiReadResult> {
     if (!validHwnd(hwnd)) return { ok: false, reason: "invalid window" };
     try {
-      const raw = await runPowerShell<RawUi>(UIA_SCRIPT.replace("__HWND__", String(hwnd)), 20_000);
+      let raw: RawUi;
+      try { raw = await uiaHost.request<RawUi>(`uia ${hwnd}`, 20_000); if (!raw.ok) throw new Error("helper could not read it"); }
+      catch { raw = await runPowerShell<RawUi>(UIA_SCRIPT.replace("__HWND__", String(hwnd)), 20_000); }
       if (!raw.ok) return { ok: false, reason: "Windows UI Automation couldn't read that window" };
       const items: UiNode[] = (Array.isArray(raw.items) ? raw.items : raw.items ? [raw.items] : []).map((i) => ({
         type: String(i.t), name: String(i.n ?? ""), enabled: !!i.e, offscreen: !!i.o,
@@ -432,6 +460,18 @@ export const nodeScreen: ScreenPort = {
       if (!raw.ok) return { ok: false, reason: OCR_REASONS[raw.error ?? ""] ?? "the screenshot couldn't be read" };
       const lines = Array.isArray(raw.lines) ? raw.lines : raw.lines ? [raw.lines] : [];
       return { ok: true, lines: lines.map(String) };
+    } catch {
+      return { ok: false, reason: "reading the screenshot took too long" };
+    }
+  },
+
+  async ocrWords(hwnd: number): Promise<OcrWordsResult> {
+    if (!validHwnd(hwnd)) return { ok: false, reason: "invalid window" };
+    try {
+      const raw = await runPowerShell<RawOcr>(WORDS_SCRIPT.replace("__HWND__", String(hwnd)), 30_000);
+      if (!raw.ok) return { ok: false, reason: OCR_REASONS[raw.error ?? ""] ?? "the screenshot couldn't be read" };
+      const w = Array.isArray(raw.words) ? raw.words : raw.words ? [raw.words] : [];
+      return { ok: true, words: w.filter((x) => x.w > 0 && x.h > 0).map((x) => ({ text: String(x.t), rect: { l: x.l, t: x.y, w: x.w, h: x.h } })) };
     } catch {
       return { ok: false, reason: "reading the screenshot took too long" };
     }
