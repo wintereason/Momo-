@@ -1,0 +1,9 @@
+# Line endings.
+#
+# core.autocrlf=true (the usual Windows setup) turns LF files into CRLF on checkout. Two audit tests compare the exact
+# text of these source files, newlines included, so they must be LF on every checkout, whatever the local Git settings:
+#   src/audit/ai.test.ts      reads prompts.ts  ("}).strict();\nexport type VisionAnswer")
+#   src/audit/privacy.test.ts reads main.cjs    (/\n  return s;\n\}/)
+# Every other file keeps Git's default behaviour.
+src/runtime-core/orchestrator/ai/prompts.ts text eol=lf
+electron/main.cjs text eol=lf
