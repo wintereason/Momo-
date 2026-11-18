@@ -1,4 +1,4 @@
-import type { ActResult, ActionPort, FsPort, InputPort, SetTextResult, SubmitResult, WindowState } from "../shared/ports";
+import type { ActResult, ActionPort, FsPort, InputPort, PlacementResult, SetTextResult, SubmitResult, WindowState } from "../shared/ports";
 
 export type ActionResult = ActResult;
 
@@ -63,6 +63,21 @@ export class ActionAgent {
   async state(hwnd: number): Promise<WindowState> {
     if (!this.input) return { exists: false, minimized: false, pid: 0, foregroundPid: null };
     return this.input.windowState(hwnd);
+  }
+
+  /** READ-ONLY: where Windows keeps this window and where it is now. null = this build cannot read placements (older ports, simple fakes). */
+  async placement(hwnd: number): Promise<PlacementResult | null> {
+    if (!this.input?.windowPlacement) return null;
+    return this.input.windowPlacement(hwnd);
+  }
+
+  /** Put the window back at its recorded normal placement. null = this build cannot do that. The caller must read the placement back and compare. */
+  async restorePlacement(t: WindowTarget): Promise<ActResult | null> {
+    if (!this.input?.restoreWindowPlacement) return null;
+    const c = await this.checkWindow(t);
+    if (!c.ok) return c;
+    this.calls++;
+    return this.input.restoreWindowPlacement(t.hwnd);
   }
 
   /** Pre-action check: the window must still exist and still be the same program. */

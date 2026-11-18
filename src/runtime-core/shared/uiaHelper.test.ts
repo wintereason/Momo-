@@ -153,7 +153,7 @@ describe("the long-lived UI Automation helper process", () => {
   });
 
   // The C# inside the script is only compiled by Windows PowerShell: a typo in it silently turns the helper off (everything falls back to the slow script).
-  it.runIf(process.platform === "win32")("the REAL script compiles and answers (ping, window state with hung + modal facts)", async () => {
+  it.runIf(process.platform === "win32")("the REAL script compiles and answers (ping, window state with hung + modal facts, window placement)", async () => {
     const h = new UiaHost();
     try {
       expect(await h.request("ping", 30_000)).toMatchObject({ ok: true });
@@ -162,7 +162,52 @@ describe("the long-lived UI Automation helper process", () => {
       expect(st.ok).toBe(true);
       expect(typeof st.hung).toBe("boolean");
       expect(typeof st.modal).toBe("boolean");
+      // window placement (arrange_window restore): read-only for a real window; a safe refusal for a window that does not exist. The write command is only ever given
+      // a window that does not exist here, so no real window is touched. (Folded into this test on purpose: a second helper would double the CPU spent compiling the script.)
+      type Raw = { ok: boolean; error?: string; showCmd?: number; workspaceNormal?: { l: number; t: number; w: number; h: number }; current?: { l: number; t: number; w: number; h: number }; origin?: { x: number; y: number }; coordinateSystem?: "workspace" | "screen" };
+      if (wins.windows.length > 0) {
+        const p = await h.request<Raw>(`wplace ${wins.windows[0].hwnd}`, 10_000);
+        expect(p.ok).toBe(true);
+        expect(["workspace", "screen"]).toContain(p.coordinateSystem);
+        expect(Number.isInteger(p.showCmd)).toBe(true);
+        for (const r of [p.workspaceNormal!, p.current!]) for (const k of ["l", "t", "w", "h"] as const) expect(Number.isFinite(r[k])).toBe(true);
+        expect(p.current!.w).toBeGreaterThan(0);
+        expect(Number.isFinite(p.origin!.x) && Number.isFinite(p.origin!.y)).toBe(true);
+      }
+      const gone = 2147430000;   // no such window
+      expect(await h.request(`wplace ${gone}`, 10_000)).toEqual({ ok: false, error: "gone" });
+      expect(await h.request(`wrestore ${gone}`, 10_000)).toEqual({ ok: false, error: "gone" });
       expect(h.stats().failures).toBe(0);
     } finally { h.stop(); }
   }, 40_000);
+
+
+  describe("the placement commands (source guards)", () => {
+    it("offers exactly the two commands, and the restore passes the recorded rectangle back unchanged", () => {
+      expect(HELPER_SCRIPT).toContain("'wplace'");
+      expect(HELPER_SCRIPT).toContain("'wrestore'");
+      const restore = HELPER_SCRIPT.slice(HELPER_SCRIPT.indexOf("public static string RestorePlacement"), HELPER_SCRIPT.indexOf("static extern bool SetProcessDpiAwarenessContext"));
+      // the normal rectangle is read from Windows and written back as it is: never converted, never invented
+      expect(restore).toMatch(/GetWindowPlacement\(h, ref p\)/);
+      expect(restore).toMatch(/SetWindowPlacement\(h, ref p\)/);
+      expect(restore).not.toMatch(/p\.normal\.(l|t|r|b)\s*=[^=]/);
+      expect(restore).toMatch(/p\.showCmd = 1/);                       // SW_SHOWNORMAL
+      expect(restore).toMatch(/p\.flags \|= 4/);                       // WPF_ASYNCWINDOWPLACEMENT: a stuck window cannot block the helper
+      expect(restore).toMatch(/no_normal/);                            // no usable normal rectangle: refused
+    });
+  
+    it("SetWindowPlacement is used in one place only, and nothing else in the helper moves, resizes or shows a window", () => {
+      expect(HELPER_SCRIPT.match(/SetWindowPlacement/g)?.length).toBe(2);   // the declaration and the single call
+      expect(HELPER_SCRIPT).not.toMatch(/SetWindowPos|MoveWindow|ShowWindow|SendInput|keybd_event|mouse_event/);
+    });
+  
+    it("the read-only command reads the placement, the window rectangle and the primary work area, and writes nothing", () => {
+      const read = HELPER_SCRIPT.slice(HELPER_SCRIPT.indexOf("public static string Placement"), HELPER_SCRIPT.indexOf("public static string RestorePlacement"));
+      expect(read).toMatch(/GetWindowPlacement/);
+      expect(read).toMatch(/GetWindowRect/);
+      expect(read).toMatch(/MonitorFromPoint\(zero, 1\)/);              // MONITOR_DEFAULTTOPRIMARY: the monitor whose work area is the workspace origin
+      expect(read).not.toMatch(/SetWindowPlacement/);
+      expect(read).toMatch(/workspaceNormal/);                          // raw: the conversion is the tested sum in placementFromRaw
+    });
+  });
 });

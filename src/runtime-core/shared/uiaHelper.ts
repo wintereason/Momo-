@@ -129,6 +129,48 @@ public static class MomoHost {
     return "{\"ok\":true,\"exists\":" + B(ex) + ",\"minimized\":" + B(ex && IsIconic(h)) + ",\"pid\":" + pid + ",\"fgPid\":" + fgPid + ",\"hung\":" + B(ex && IsHungAppWindow(h)) + ",\"modal\":" + B(ex && !IsIconic(h) && GetWindow(h, 6) != IntPtr.Zero && GetWindow(h, 6) != h) + "}";
   }
 
+  // ---------------------------------------------------------------- window placement (the normal position Windows recorded, and putting a window back there)
+  // WINDOWPLACEMENT keeps rcNormalPosition in WORKSPACE coordinates for ordinary top-level windows: relative to the top-left corner of the primary monitor's work
+  // area (the screen minus the taskbar). Windows with WS_EX_TOOLWINDOW instead report it in SCREEN coordinates. The helper reports which coordinate system the
+  // rectangle is in, and the Node side converts only when needed (a plain, unit-tested sum). This process is per-monitor DPI aware, so everything here is in
+  // physical pixels, like GetWindowRect and the pointer. The outer rectangle (invisible resize borders included) is used on both sides.
+  [StructLayout(LayoutKind.Sequential)] struct WPLACE { public int length, flags, showCmd; public PT ptMin, ptMax; public RECTI normal; }
+  [StructLayout(LayoutKind.Sequential)] struct MONINFO { public int size; public RECTI monitor, work; public int flags; }
+  [DllImport("user32.dll")] static extern bool GetWindowPlacement(IntPtr h, ref WPLACE p);
+  [DllImport("user32.dll")] static extern bool SetWindowPlacement(IntPtr h, ref WPLACE p);
+  [DllImport("user32.dll")] static extern IntPtr MonitorFromPoint(PT pt, uint flags);
+  [DllImport("user32.dll")] static extern bool GetMonitorInfo(IntPtr m, ref MONINFO i);
+  static string RectJson(int l, int t, int r, int b) { return "{\"l\":" + l + ",\"t\":" + t + ",\"w\":" + (r - l) + ",\"h\":" + (b - t) + "}"; }
+
+  /** READ-ONLY: the show state, the recorded normal rectangle with the coordinate system it uses, where the window is now (screen) and the work-area origin. */
+  public static string Placement(long hwnd) {
+    IntPtr h = new IntPtr(hwnd);
+    if (!IsWindow(h)) return "{\"ok\":false,\"error\":\"gone\"}";
+    WPLACE p = new WPLACE(); p.length = Marshal.SizeOf(typeof(WPLACE));
+    RECTI cur;
+    PT zero = new PT();
+    IntPtr mon = MonitorFromPoint(zero, 1);   // MONITOR_DEFAULTTOPRIMARY
+    MONINFO mi = new MONINFO(); mi.size = Marshal.SizeOf(typeof(MONINFO));
+    if (!GetWindowPlacement(h, ref p) || !GetWindowRect(h, out cur) || mon == IntPtr.Zero || !GetMonitorInfo(mon, ref mi)) return "{\"ok\":false,\"error\":\"failed\"}";
+    // GWL_EXSTYLE (-20), WS_EX_TOOLWINDOW (0x80): only this RAW bit decides the coordinate system, even when WS_EX_APPWINDOW is also set.
+    string coords = (GetWindowLong(h, -20) & 0x80) != 0 ? "screen" : "workspace";
+    return "{\"ok\":true,\"showCmd\":" + p.showCmd + ",\"coordinateSystem\":\"" + coords + "\",\"workspaceNormal\":" + RectJson(p.normal.l, p.normal.t, p.normal.r, p.normal.b) + ",\"current\":" + RectJson(cur.l, cur.t, cur.r, cur.b) + ",\"origin\":{\"x\":" + mi.work.l + ",\"y\":" + mi.work.t + "}}";
+  }
+
+  /**
+   * Put the window back at the normal placement Windows recorded: SW_SHOWNORMAL, with rcNormalPosition passed back EXACTLY as Windows gave it (no conversion, nothing invented).
+   * A window with no usable normal rectangle is refused. WPF_ASYNCWINDOWPLACEMENT posts the request if the window's thread is stuck, so this helper is never blocked by it.
+   */
+  public static string RestorePlacement(long hwnd) {
+    IntPtr h = new IntPtr(hwnd);
+    if (!IsWindow(h)) return "{\"ok\":false,\"error\":\"gone\"}";
+    WPLACE p = new WPLACE(); p.length = Marshal.SizeOf(typeof(WPLACE));
+    if (!GetWindowPlacement(h, ref p)) return "{\"ok\":false,\"error\":\"failed\"}";
+    if (p.normal.r - p.normal.l < 50 || p.normal.b - p.normal.t < 50) return "{\"ok\":false,\"error\":\"no_normal\"}";
+    p.showCmd = 1;
+    p.flags |= 4;
+    return SetWindowPlacement(h, ref p) ? "{\"ok\":true}" : "{\"ok\":false,\"error\":\"failed\"}";
+  }
   [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr c);
   /** physical pixels on every monitor, whatever its scaling: the coordinates the pointer uses (a DPI-unaware host would be given scaled ones) */
   public static void Dpi() { try { SetProcessDpiAwarenessContext(new IntPtr(-4)); } catch { } }
@@ -690,6 +732,8 @@ while ($true) {
     elseif ($p[1] -eq 'menu') { $out = [MomoHost]::Menu([long]$p[2]) }
     elseif ($p[1] -eq 'at') { $out = [MomoHost]::At([int]$p[2], [int]$p[3]) }
     elseif ($p[1] -eq 'state') { $out = [MomoHost]::State([long]$p[2]) }
+    elseif ($p[1] -eq 'wplace') { $out = [MomoHost]::Placement([long]$p[2]) }
+    elseif ($p[1] -eq 'wrestore') { $out = [MomoHost]::RestorePlacement([long]$p[2]) }
     elseif ($p[1] -eq 'windows') { $out = [MomoHost]::Windows() }
     elseif ($p[1] -eq 'uiaplain') { [MomoHost]::Plain = $true; try { $out = [MomoHost]::Read([long]$p[2]) } finally { [MomoHost]::Plain = $false } }
     elseif ($p[1] -eq 'prof') { $out = [MomoHost]::Prof() }

@@ -10,7 +10,7 @@ import { browserKeyFor, hintWords, matchProfileHint, profileLabels, siteUrl, typ
 import { BROWSER_PROCESSES, browserName, extractPage, isPrivateWindow, matchTabs } from "../browser";
 import type { DesktopAgent, DesktopSnapshot } from "../desktop";
 import type { DriveInfo, FileSystemAgent } from "../filesystem";
-import type { BrowserKey, BrowserProfile, ForegroundPort, FsPort, PointerPort, PointerResult, UiNode, UiReadResult } from "../shared/ports";
+import type { BrowserKey, BrowserProfile, ForegroundPort, FsPort, PlacementResult, PointerPort, PointerResult, PxRect, UiNode, UiReadResult } from "../shared/ports";
 import {
   MAX_LINES, SPARSE_TEXT_CHARS, boxKey, cleanScreenText, describePlace, onScreen, collectControls, collectText, errorLines, matchControls, signature, totalChars, visibleNames,
 } from "../shared/screenText";
@@ -285,6 +285,69 @@ async function isFront(ctx: ToolCtx, win: Win): Promise<boolean> {
  */
 function until<T>(ctx: ToolCtx, check: () => Promise<T | false | null | undefined>, o: { timeoutMs: number; win?: number; pollMs?: number }) {
   return waitFor(check, { timeoutMs: o.timeoutMs, pollMs: o.pollMs, fallbackMs: Math.max((o.pollMs ?? 150) * 2, 250), source: ctx.d.changes, relevant: relevantTo(o.win), sleep: sleeper(ctx), live: () => ctx.live() });
+}
+
+/** how far (physical px, on each of left, top, width, height) a window may differ from its recorded normal rectangle and still count as back at its normal place */
+export const RESTORE_TOLERANCE_PX = 6;
+const nearRect = (a: PxRect, b: PxRect): boolean => Math.abs(a.l - b.l) <= RESTORE_TOLERANCE_PX && Math.abs(a.t - b.t) <= RESTORE_TOLERANCE_PX && Math.abs(a.w - b.w) <= RESTORE_TOLERANCE_PX && Math.abs(a.h - b.h) <= RESTORE_TOLERANCE_PX;
+const rectWords = (r: PxRect): string => `${r.w}×${r.h} at ${r.l},${r.t}`;
+const SHOW_WORD: Record<number, string> = { 1: "in its normal state", 2: "minimized", 3: "maximized" };
+
+/**
+ * arrange_window "restore": put the window back at the NORMAL rectangle Windows recorded for it (what a snapped or maximized window returns to), and say "restored"
+ * only when the window is really there. Pressing Win+Down is NOT used: on a half-snapped window it moves the window to a quarter of the screen (a changed rectangle that is
+ * not a restore), on a normal one it minimizes it.
+ *
+ * Verification is against the recorded normal rectangle, never "did the rectangle change": both rectangles are read from Windows (outer rectangles, physical pixels, the
+ * workspace offset already added: see placementFromRaw) and must agree within RESTORE_TOLERANCE_PX, with the window in its normal show state, and hold still.
+ *
+ * Returns null when this build cannot read placements (the caller then uses the key path, which never claims "restored"). Every refusal before the request leaves the window
+ * untouched and says so. After the request, anything that is not confirmed is reported as NOT confirmed, with where the window is.
+ */
+async function restoreToNormal(ctx: ToolCtx, win: Win): Promise<ToolOutcome | null> {
+  const agent = ctx.d.actionAgent;
+  const title = short(win.title);
+  const before = await agent.placement(win.hwnd);
+  if (before === null) return null;
+  if (!ctx.live()) return fail("cancelled");
+  // nothing has been sent in any of the three refusals below: failBeforeActing says so, which is what keeps a retry safe
+  const kindOf = (reason: string): Failure["kind"] => (/closed/.test(reason) ? "target_gone" : /in time/.test(reason) ? "timeout" : "uia_failed");
+  if (!before.ok) return failBeforeActing(`I could not read where "${title}" belongs on screen (${before.reason}), so I did not try to restore it. Nothing was changed.`, kindOf(before.reason));
+  const n = before.normal;
+  if (n.w < 50 || n.h < 50) return failBeforeActing(`Windows has no usable normal size recorded for "${title}", so I did not try to restore it. Nothing was changed.`, "unavailable");
+  if (before.showCmd === 1 && nearRect(before.current, n)) return ok(`"${title}" is already at its normal size and position (${rectWords(n)}), so there was nothing to restore.`, true, undefined, "Already at its normal size");
+
+  const res = await agent.restorePlacement({ hwnd: win.hwnd, pid: win.pid });
+  if (!ctx.live()) return fail("cancelled");
+  if (res === null) return failBeforeActing(`I could not restore "${title}" (this build cannot do that). Nothing was changed.`, "unavailable");
+  // Windows refused the request: nothing moved. No answer in time is different: the request may have been applied, so it is never repeated blindly.
+  if (!res.ok) return /in time/.test(res.reason) ? { ok: false, reason: `I asked Windows to restore "${title}" but it did not answer in time, so I do not know whether it moved.`, failure: { kind: "timeout", acted: "maybe" } } : failBeforeActing(`I could not restore "${title}" (${res.reason}). Nothing was changed.`, "unavailable");
+
+  // the window HAS been asked to move: wait until it holds still, then compare with the recorded normal rectangle
+  const seen: { last: PlacementResult | null } = { last: null };
+  let key0 = "";
+  const waited = await until(ctx, async () => {
+    const now = await agent.placement(win.hwnd);
+    if (!now) return false;
+    seen.last = now;
+    if (!now.ok) return false;
+    const key = `${now.current.l},${now.current.t},${now.current.w},${now.current.h},${now.showCmd}`;
+    const still = key === key0;
+    key0 = key;
+    return still && now.showCmd === 1 && nearRect(now.current, n);
+  }, { timeoutMs: 2500, win: win.hwnd, pollMs: 120 });
+  if (waited.cancelled || !ctx.live()) return fail("cancelled");
+  const final = seen.last ?? (await agent.placement(win.hwnd));
+  const done = (brief: string, verified: boolean, shown?: string): ToolOutcome => ({ ok: true, brief, report: brief, verified, acted: "yes", ...(shown ? { shown } : {}) });
+  const matches = !!final && final.ok && final.showCmd === 1 && nearRect(final.current, n);
+  // "restored" needs BOTH: the wait saw two consecutive matching readings (waited.value: the window held still), and the last reading is readable, normal and within tolerance.
+  // A last reading that happens to match after a timeout is not enough: the window may still be moving.
+  if (waited.value && matches && final && final.ok) {
+    return done(`"${title}" was restored to its normal size and position (${rectWords(n)}): the place Windows recorded for it, checked against where it is now (within ${RESTORE_TOLERANCE_PX} px).`, true, "Window restored to its normal size");
+  }
+  if (matches && final && final.ok) return done(`I asked Windows to restore "${title}" to its normal size and position (${rectWords(n)}) and its last reading is at ${rectWords(final.current)}, but it did not hold still for two readings in a row, so I cannot confirm it was restored.`, false);
+  const where = !final ? "somewhere I could not read" : !final.ok ? `somewhere I could not read (${final.reason})` : `${SHOW_WORD[final.showCmd] ?? "in an unknown state"} at ${rectWords(final.current)}`;
+  return done(`I asked Windows to restore "${title}" to its normal size and position (${rectWords(n)}), but it is ${where}, so I cannot say it was restored.`, false);
 }
 
 /** In front and, when the real pointer can measure it, holding still (a restore or snap animation has finished): coordinates read before that are stale. */
@@ -1447,7 +1510,7 @@ export function buildTools(): ToolDef[] {
   const SNAP: Record<string, { keys: string; word: string }> = { left: { keys: "win+left", word: "snapped to the left half" }, right: { keys: "win+right", word: "snapped to the right half" }, maximize: { keys: "win+up", word: "maximized" }, restore: { keys: "win+down", word: "restored to its normal size" } };
   add({
     name: "arrange_window", signature: "arrange_window({to: \"left\"|\"right\"|\"maximize\"|\"restore\", window?})",
-    description: "Move and resize a window the way a person does with the keyboard: snap it to the left or right half of the screen, maximize it, or restore its size. Checks where the window really ended up. Needs Human-like control.",
+    description: "Move and resize a window the way a person does with the keyboard: snap it to the left or right half of the screen, maximize it, or restore it to the normal size and position Windows recorded for it (a restore is checked against that recorded place, not just \"it moved\"). Checks where the window really ended up. Needs Human-like control.",
     sensitive: false, risk: "reversible",
     schema: z.object({ to: z.enum(["left", "right", "maximize", "restore"]), window: winArg, _hwnd: z.number().int().optional() }).strict(),
     describe: (a) => `${a.to === "maximize" ? "Maximize" : a.to === "restore" ? "Restore" : "Snap"} ${a.window ? `“${short(String(a.window), 40)}”` : "the window you were in"}?`,
@@ -1462,6 +1525,11 @@ export function buildTools(): ToolDef[] {
       const fr = await bringToFront(ctx, win);
       if (!ctx.live()) return fail("cancelled");
       if (!fr.front) return fail(`I could not bring "${short(win.title)}" to the front.`);
+      if (a.to === "restore") {
+        // Windows' own record of where the window belongs, then verified against it. null: this build cannot read placements, so the key path below runs and never claims "restored".
+        const placed = await restoreToNormal(ctx, win);
+        if (placed) return placed;
+      }
       const before = p.windowRect(win.hwnd);
       const s = SNAP[String(a.to)];
       if (before) await aimAt(ctx, { l: before.l + before.w / 2 - 60, t: before.t + 4, w: 120, h: 32 }, win.title, `Pressing ${s.keys}`);
@@ -1491,6 +1559,8 @@ export function buildTools(): ToolDef[] {
         return ok(`Pressed ${s.keys}, but that minimized "${short(win.title)}" (it was probably not maximized), so it was not ${s.word}. I brought it back.`, false);
       }
       const moved = !!before && !!after && (Math.abs(before.l - after.l) > 8 || Math.abs(before.t - after.t) > 8 || Math.abs(before.w - after.w) > 8 || Math.abs(before.h - after.h) > 8);
+      // a restore by key cannot be checked against the window's recorded normal place: a changed rectangle is NOT "restored" (Win+Down on a snapped window gives a quarter-screen)
+      if (moved && a.to === "restore") return ok(`Pressed ${s.keys} and "${short(win.title)}" changed (${before!.w}×${before!.h} → ${after!.w}×${after!.h}), but this build cannot read where the window's normal position is, so I cannot confirm it is back at its normal size.`, false);
       return moved
         ? ok(`"${short(win.title)}" was ${s.word}: its position and size changed (${before!.w}×${before!.h} → ${after!.w}×${after!.h}).`, true, undefined, `Window ${s.word}`)
         : ok(`Pressed ${s.keys}, but "${short(win.title)}" is where it was (it may already be like that), so I cannot confirm it changed.`, false);

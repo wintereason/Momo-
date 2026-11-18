@@ -154,12 +154,36 @@ export interface PointerPort {
  * Acting on windows and controls. Every call targets one identified window (and, for controls, one
  * control by runtime id) and refuses if what it finds no longer matches what was approved.
  */
+/** A rectangle in physical SCREEN pixels. */
+export interface PxRect { l: number; t: number; w: number; h: number }
+
+/**
+ * Where Windows keeps a window and where it will put it again when it is restored. Everything is in physical screen pixels and is the OUTER rectangle (invisible
+ * resize borders included, exactly like GetWindowRect), so `normal` and `current` can be compared directly.
+ */
+export interface WindowPlacement {
+  /** the show state as Windows reports it: 1 normal, 2 minimized, 3 maximized */
+  showCmd: number;
+  /** the "normal" rectangle Windows recorded (rcNormalPosition: the place a snapped or maximized window returns to), already converted from workspace coordinates */
+  normal: PxRect;
+  /** where the window is right now, read in the same call */
+  current: PxRect;
+}
+export type PlacementResult = ({ ok: true } & WindowPlacement) | { ok: false; reason: string };
+
 export interface InputPort {
   focusWindow(hwnd: number): Promise<ActResult>;
   minimizeWindow(hwnd: number): Promise<ActResult>;
   /** asks the window to close normally (like clicking its X): it may still prompt to save */
   closeWindow(hwnd: number): Promise<ActResult>;
   windowState(hwnd: number): Promise<WindowState>;
+  /** READ-ONLY: the window's recorded normal placement and where it is now. Absent in simple fakes and older builds. */
+  windowPlacement?(hwnd: number): Promise<PlacementResult>;
+  /**
+   * Put the window back at the normal placement Windows recorded for it (SW_SHOWNORMAL with the recorded rectangle left exactly as it is; asynchronous, so a stuck
+   * window cannot block the caller). It does not say where the window ended up: read windowPlacement afterwards and compare.
+   */
+  restoreWindowPlacement?(hwnd: number): Promise<ActResult>;
   /** click via UI Automation. `expectName` guards against the control having changed since it was found. */
   invokeControl(hwnd: number, rid: string, expectName: string): Promise<ActResult>;
   setControlText(hwnd: number, rid: string, expectName: string, text: string): Promise<SetTextResult>;

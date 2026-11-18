@@ -1,5 +1,6 @@
 import { runPowerShell, uiaHost } from "../shared/nodePorts";
-import type { ActResult, InputPort, SetTextResult, SubmitResult, WindowState } from "../shared/ports";
+import type { ActResult, InputPort, PlacementResult, SetTextResult, SubmitResult, WindowState } from "../shared/ports";
+import { placementFromRaw, type RawPlacement } from "./placement";
 
 /**
  * Real window and control actions (Windows). Every script is FIXED text; the target and any text to
@@ -192,6 +193,8 @@ const windowAct = async (mode: "focus" | "minimize" | "close", hwnd: number): Pr
   }
 };
 
+const PLACEMENT_REASONS: Record<string, string> = { ...WINDOW_REASONS, no_normal: "Windows has no usable normal size recorded for that window" };
+
 /** Real window and control actions. */
 export const nodeInput: InputPort = {
   focusWindow: (h) => windowAct("focus", h),
@@ -207,6 +210,29 @@ export const nodeInput: InputPort = {
       return { exists: !!r.exists, minimized: !!r.minimized, pid: r.pid ?? 0, foregroundPid: r.fgPid && r.fgPid > 0 ? r.fgPid : null, ...(typeof r.hung === "boolean" ? { hung: r.hung } : {}), ...(typeof r.modal === "boolean" ? { modal: r.modal } : {}) };
     } catch {
       return { exists: false, minimized: false, pid: 0, foregroundPid: null };
+    }
+  },
+
+  /** READ-ONLY: the recorded normal placement and where the window is now, from the DPI-aware helper (physical pixels). Needs the helper: there is no one-shot fallback. */
+  async windowPlacement(hwnd: number): Promise<PlacementResult> {
+    if (!validHwnd(hwnd)) return { ok: false, reason: "that isn't a valid window" };
+    try {
+      const r = await uiaHost.request<RawPlacement>(`wplace ${hwnd}`, 4000);
+      if (!r.ok) return { ok: false, reason: PLACEMENT_REASONS[r.error ?? ""] ?? PLACEMENT_REASONS.failed };
+      return placementFromRaw(r);
+    } catch {
+      return { ok: false, reason: "Windows didn't answer in time" };
+    }
+  },
+
+  /** SetWindowPlacement with the recorded normal rectangle and SW_SHOWNORMAL (see the helper). Says only whether Windows accepted it: the caller reads the result back. */
+  async restoreWindowPlacement(hwnd: number): Promise<ActResult> {
+    if (!validHwnd(hwnd)) return { ok: false, reason: "that isn't a valid window" };
+    try {
+      const r = await uiaHost.request<RawPlacement>(`wrestore ${hwnd}`, 4000);
+      return r.ok ? { ok: true } : { ok: false, reason: PLACEMENT_REASONS[r.error ?? ""] ?? PLACEMENT_REASONS.failed };
+    } catch {
+      return { ok: false, reason: "Windows didn't answer in time" };
     }
   },
 
