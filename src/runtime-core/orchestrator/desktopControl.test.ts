@@ -89,15 +89,13 @@ describe("an app that is already running is not started twice", () => {
     expect(p.log).toEqual([]);
     expect(lastStep(t.results)!.text).toMatch(/already open and in front/);
   });
-  it("with SEVERAL windows and none in front, it does not guess: it asks which, naming each with its state", async () => {
-    const p = pc({ windows: [notepad(0), chrome(4, { hwnd: 21, pid: 20, title: "Mail - Google Chrome", minimized: true }), chrome(1)] });
+  it("with SEVERAL windows and none in front, it uses the front-most visible one instead of asking", async () => {
+    const p = pc({ windows: [notepad(0), chrome(4, { hwnd: 21, pid: 21, title: "Mail - Google Chrome", minimized: true }), chrome(1)] });
     const t = run(p, [tool("open_app", { app: "Google Chrome" }), done("ok")]);
     await t.session.handleTranscript("s", "open chrome");
-    const q = t.last() as { type: string; question: string; options?: { label: string; detail?: string }[] };
-    expect(q.type).toBe("task.clarification_required");
-    expect(q.options!.map((o) => o.label)).toEqual(["Docs - Google Chrome", "Mail - Google Chrome"]); // front-most first
-    expect(q.options!.map((o) => o.detail)).toEqual(["open behind other windows", "minimized"]);
-    expect(p.log).toEqual([]); // nothing was touched, nothing launched
+    expect(t.events.some((e) => e.type === "task.clarification_required")).toBe(false);
+    expect(p.log).toContain("focus:20"); // "Docs", the front-most visible one: not the minimized "Mail"
+    expect(p.log.some((l) => l.startsWith("launch:"))).toBe(false);
   });
   it("brings forward exactly the window the user picked (and restores it if minimized)", async () => {
     const p = pc({ windows: [notepad(0), chrome(4, { hwnd: 21, pid: 21, title: "Mail - Google Chrome", minimized: true }), chrome(1)] });

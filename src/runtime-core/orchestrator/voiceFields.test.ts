@@ -227,7 +227,7 @@ describe("select the search bar: only the one SHOWN on screen, and ask which pan
   });
 });
 
-describe("opening things: the ghost acts out the steps a person would take, before Momo does it", () => {
+describe("opening things: the ghost never acts out steps Momo does not really take", () => {
   const taskbar = (extra: UiNode[] = []): UiNode[] => [
     node({ type: "Button", name: "Start", rid: "s", rect: { l: 10, t: 1000, w: 48, h: 48 } }),
     node({ type: "Button", name: "Search", rid: "se", rect: { l: 70, t: 1000, w: 200, h: 48 } }),
@@ -254,21 +254,17 @@ describe("opening things: the ghost acts out the steps a person would take, befo
     return { session, order, events };
   }
 
-  it("a pinned app: glides to its taskbar icon and clicks it, THEN launches", async () => {
+  it("a pinned app: the ghost does NOT act out a taskbar click Momo never makes; it just launches", async () => {
     const chrome = node({ type: "Button", name: "Google Chrome - 2 running windows", rid: "c", rect: { l: 300, t: 1000, w: 48, h: 48 } });
     const t = runOpen(taskbar([chrome]), [tool("open_app", { app: "Google Chrome" }), done("ok")]);
     await t.session.handleTranscript("s", "open chrome");
-    const click = t.order.findIndex((o) => o.startsWith("click:Taskbar"));
-    expect(click).toBe(0);
-    expect(t.order.indexOf("LAUNCH:Chrome")).toBeGreaterThan(click);
-    const move = t.events.find((e) => e.type === "cursor.move") as { x: number; y: number };
-    expect([move.x, move.y]).toEqual([324, 1024]); // the centre of THAT icon
+    expect(t.order).toContain("LAUNCH:Chrome");
+    expect(t.events.some((e) => e.type === "cursor.move")).toBe(false); // nothing invented: the ghost only shows real targets
   });
-  it("an app that is not on the taskbar: Start, type its name, press Enter, THEN launches", async () => {
+  it("an app that is not on the taskbar: no scripted Start / type / Enter show either", async () => {
     const t = runOpen(taskbar(), [tool("open_app", { app: "Google Chrome" }), done("ok")]);
     await t.session.handleTranscript("s", "open chrome");
-    expect(t.order.slice(0, 3)).toEqual(["click:Start", "type:Search:Google Chrome", "submit:Open Google Chrome"]);
-    expect(t.order.indexOf("LAUNCH:Chrome")).toBe(3);
+    expect(t.order).toEqual(["LAUNCH:Chrome"]);
   });
   it("without a readable taskbar, or with the shadow cursor off, it just opens it", async () => {
     const a = runOpen(null, [tool("open_app", { app: "Google Chrome" }), done("ok")]);

@@ -436,6 +436,19 @@ describe("browser accounts: described, matched, confirmed", () => {
     expect(t.pc.log).toEqual(["profile:chrome:Profile 2:https://www.youtube.com/"]);
   });
 
+  it("Chrome is ALREADY open and the user named no account: the site opens in the running Chrome, with no question", async () => {
+    const t = setup([tool("open_app", { app: "Google Chrome", url: "youtube" }), done("Opened YouTube.")], makePc({ profiles, windows: [raw(20, 20, "chrome", "Docs - Google Chrome")] }));
+    await t.session.handleTranscript("s", "open youtube and play some songs");
+    expect(t.events.some((e) => e.type === "task.clarification_required")).toBe(false);
+    expect(t.pc.log).toEqual(["profile:chrome:null:https://www.youtube.com/"]); // no account switch: the running browser takes the address
+  });
+
+  it("a NAMED account is still honoured even when Chrome is already open", async () => {
+    const t = setup([tool("open_app", { app: "Google Chrome", account: "work", url: "youtube" }), done("Done.")], makePc({ profiles, windows: [raw(20, 20, "chrome", "Docs - Google Chrome")] }));
+    await t.session.handleTranscript("s", "open youtube in my work chrome");
+    expect(t.pc.log).toEqual(["profile:chrome:Profile 2:https://www.youtube.com/"]);
+  });
+
   it("no description, several accounts: Momo asks, listing the emails (which the planner never sees)", async () => {
     const t = setup([tool("open_app", { app: "Google Chrome" }), done("Opened Chrome.")], makePc({ profiles }));
     await t.session.handleTranscript("s", "open chrome");

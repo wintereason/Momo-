@@ -202,23 +202,6 @@ async function pointAt(ctx: ToolCtx, node: UiNode, action: "look" | "select" | "
   if (wait && lead > 0) await sleeper(ctx)(lead);
 }
 
-// ---- Showing the steps a person would take. This is a SHOW for the user: the ghost walks through the taskbar icon / Start menu /
-// address bar the way someone would, one step at a time, and Momo's real action (a direct, verified call) happens right after.
-// Nothing here moves the real mouse or presses a key; it only draws. It does nothing at all when the shadow cursor is off.
-interface DemoStep { rect: NonNullable<UiNode["rect"]>; action: "look" | "select" | "click" | "type" | "submit"; label: string; text?: string; say: string }
-
-async function walkSteps(ctx: ToolCtx, steps: DemoStep[]): Promise<void> {
-  const lead = ctx.d.cursorLeadMs?.() ?? 0;
-  if (lead <= 0) return;
-  for (const st of steps) {
-    if (!ctx.live()) return;
-    const r = st.rect;
-    const ev = parseRuntimeEvent({ type: "cursor.move", x: Math.round(r.l + r.w / 2), y: Math.round(r.t + r.h / 2), w: Math.round(r.w), h: Math.round(r.h), action: st.action, label: short(st.label, 40), text: st.text ? short(st.text, 60) : undefined, say: short(st.say, 90) });
-    if (ev) ctx.d.emit(ev);
-    await sleeper(ctx)(lead + (st.action === "type" ? 1300 : 700)); // the glide, then the action itself
-  }
-}
-
 const GENERIC_APP_WORDS = new Set(["google", "microsoft", "windows", "app", "the", "inc", "corporation"]);
 
 /** The taskbar button for an app ("Google Chrome - 2 running windows"), if it is pinned or running. */
@@ -234,47 +217,6 @@ function taskbarButton(items: UiNode[], appName: string): UiNode | undefined {
     .sort((a, b) => a.name.length - b.name.length)[0];
 }
 
-/** How a person opens an app: click its taskbar icon, or click Start, type its name and press Enter. */
-async function demoOpenApp(ctx: ToolCtx, appName: string, opts: { typed?: string; viaStart?: boolean } = {}): Promise<void> {
-  if ((ctx.d.cursorLeadMs?.() ?? 0) <= 0) return;
-  const items = await ctx.d.uiAgent.taskbar();
-  if (!items || !ctx.live()) return;
-  const pinned = opts.viaStart ? undefined : taskbarButton(items, appName);
-  if (pinned) { await walkSteps(ctx, [{ rect: pinned.rect!, action: "click", label: `Taskbar: ${short(appName, 30)}`, say: `Clicking ${short(appName, 30)} on the taskbar` }]); return; }
-  const start = items.find((n) => n.type === "Button" && /^start$/i.test(n.name.trim()) && !!n.rect);
-  if (!start) return;
-  const search = items.find((n) => /^search\b/i.test(n.name.trim()) && !!n.rect) ?? start;
-  await walkSteps(ctx, [
-    { rect: start.rect!, action: "click", label: "Start", say: "Opening the Start menu" },
-    { rect: search.rect!, action: "type", label: "Search", text: opts.typed ?? appName, say: "Searching for it" },
-    { rect: search.rect!, action: "submit", label: `Open ${short(appName, 30)}`, say: `Pressing Enter to open ${short(appName, 30)}` },
-  ]);
-}
-
-/** A website: click the browser's taskbar icon (if one is there). */
-async function demoOpenBrowser(ctx: ToolCtx): Promise<void> {
-  if ((ctx.d.cursorLeadMs?.() ?? 0) <= 0) return;
-  const items = await ctx.d.uiAgent.taskbar();
-  if (!items || !ctx.live()) return;
-  const b = items.find((n) => n.type === "Button" && !!n.rect && /\b(chrome|edge|firefox|brave|opera)\b/i.test(n.name));
-  if (b) await walkSteps(ctx, [{ rect: b.rect!, action: "click", label: `Taskbar: ${short(b.name.split(" - ")[0], 30)}`, say: "Clicking the browser on the taskbar" }]);
-}
-
-/** Then the address bar: type the site and press Enter, as a person would. */
-async function demoAddressBar(ctx: ToolCtx, host: string): Promise<void> {
-  if ((ctx.d.cursorLeadMs?.() ?? 0) <= 0) return;
-  const fg = ctx.d.foreground?.lastExternal();
-  if (!fg || !ctx.live()) return;
-  const ui = await ctx.d.uiAgent.read(fg.hwnd);
-  if (!ui.ok || !ctx.live()) return;
-  const bar = ui.items.find((n) => n.type === "Edit" && !!n.rect && /address|search or type|url/i.test(n.name));
-  if (!bar) return;
-  await walkSteps(ctx, [
-    { rect: bar.rect!, action: "type", label: "Address bar", text: host, say: "Typing the address" },
-    { rect: bar.rect!, action: "submit", label: "Go", say: "Pressing Enter to go" },
-  ]);
-}
-
 /** The same for a whole window (open, switch, minimize, close): the desktop shell works out where that window is. */
 async function pointAtWindow(ctx: ToolCtx, hwnd: number, action: "focus" | "minimize" | "close" | "open" | "look", label?: string): Promise<void> {
   const ev = parseRuntimeEvent({ type: "cursor.window", hwnd, action, label: label ? short(label, 40) : undefined });
@@ -284,23 +226,9 @@ async function pointAtWindow(ctx: ToolCtx, hwnd: number, action: "focus" | "mini
   if (lead > 0) await sleeper(ctx)(lead);
 }
 
-/**
- * Before picking ANY control, look at the screen like a person: glance over the windows that are really shown (up to two others, front to back),
- * then settle on the window the control is in. Only the shadow cursor is told (nothing is moved or clicked); a no-op when the cursor is off.
- */
+/** Before picking a control: aim at the window Momo is REALLY about to act in (no glances at other windows, no scripted steps). */
 async function lookAround(ctx: ToolCtx, win: Win): Promise<void> {
-  const lead = ctx.d.cursorLeadMs?.() ?? 0;
-  if (lead <= 0) return;
-  let others: Array<{ hwnd: number; title: string }> = [];
-  try {
-    const snap = await ctx.d.desktopAgent.snapshot();
-    others = snap.windows.filter((q) => !q.isMomo && q.hwnd !== win.hwnd && q.state !== "minimized" && q.title.trim()).slice(0, 2).map((q) => ({ hwnd: q.hwnd, title: q.title }));
-  } catch { /* the glance is only a show */ }
-  if (!ctx.live()) return;
-  for (const o of others) {
-    await pointAtWindow(ctx, o.hwnd, "look", `Looking at ${short(o.title, 28)}`);
-    if (!ctx.live()) return;
-  }
+  if ((ctx.d.cursorLeadMs?.() ?? 0) <= 0) return;
   await pointAtWindow(ctx, win.hwnd, "look", `Checking ${short(win.title, 28)}`);
 }
 
@@ -724,9 +652,7 @@ export function buildTools(): ToolDef[] {
         return { ok: false, needsConfirmation: { summary: `“${short(target, 90)}” is a program. Opening it will RUN it. Run it?`, lock: target } };
       }
       if (ctx.lock !== undefined && target !== ctx.lock) return fail("The target changed, so nothing was opened.");
-      // 3) open it (the ghost first shows how a person would: File Explorer from the taskbar, or Start and the name)
-      const baseName = target.split("\\").pop() ?? "file";
-      await (isDir ? demoOpenApp(ctx, "File Explorer") : demoOpenApp(ctx, baseName, { viaStart: true }));
+      // 3) open it
       if (!ctx.live()) return fail("cancelled");
       const before = new Set((await ctx.d.desktopAgent.snapshot()).windows.map((w) => w.hwnd));
       if (!ctx.live()) return fail("cancelled");
@@ -1660,7 +1586,12 @@ export function buildTools(): ToolDef[] {
       // a browser with several accounts is ambiguous: use the user's description, or ask which
       let profile: BrowserProfile | undefined;
       const key = browserKeyFor(app.name);
-      if (key && !a.profileDir) {
+      const snapEarly = await ctx.d.desktopAgent.snapshot();
+      if (!ctx.live()) return fail("cancelled");
+      // the browser is ALREADY open and the user named no account: carry on in it (the running browser takes the address in the window the user is
+      // using), instead of asking which account to start. Work resumes from where the screen already is.
+      const alreadyOpen = !!key && !a.profileDir && !a.account && ctx.d.verifier.runningWindows(snapEarly, app.name).length > 0;
+      if (key && !a.profileDir && !alreadyOpen) {
         const profiles = await ctx.d.appAgent.profilesOfBrowser(key);
         if (!ctx.live()) return fail("cancelled");
         if (profiles.length > 1) {
@@ -1695,8 +1626,13 @@ export function buildTools(): ToolDef[] {
         else if (a.window) { const q = norm(a.window); const hits = running.filter((w) => norm(w.title).includes(q)); if (hits.length > 0) running = hits; }
         if (running.length === 1) return activateRunning(ctx, app.name, running[0], 0);
         if (running.length > 1) {
-          // several windows: if one is already in front, that is the one in use; otherwise it is NOT clear which is meant, so ask
-          const front = running.find((w) => w.active);
+          // several windows: the one in use is picked without asking, in this order:
+          //   1. the front-most active window;
+          //   2. the window the user was in before turning to Momo (Momo's own bar may hold the focus);
+          //   3. the front-most visible window that is not minimized.
+          // Ask only when no reliable target can be picked (for example every window is minimized) or the ambiguity remains (a `window` hint that does not settle it).
+          const lastExt = ctx.d.foreground?.lastExternal()?.hwnd;
+          const front = running.find((w) => w.active) ?? running.find((w) => w.hwnd === lastExt) ?? running.find((w) => w.state !== "minimized");
           if (front && !a.window && !a._hwnd) return activateRunning(ctx, app.name, front, running.length - 1);
           const opts = running.slice(0, 8);
           const where = (w: (typeof running)[number]) => (w.state === "minimized" ? "minimized" : w.state === "maximized" ? "maximized" : w.active ? "in front" : "open behind other windows");
@@ -1712,7 +1648,6 @@ export function buildTools(): ToolDef[] {
         if (h.stop) return fail(h.stop);
         clickedTaskbar = h.done;
       }
-      if (!clickedTaskbar) await demoOpenApp(ctx, app.name); // otherwise the ghost shows how a person would start it
       if (!ctx.live()) return fail("cancelled");
       if (clickedTaskbar) { // did the click start it? (a window of that app that was not there before)
         const up0 = await until(ctx, async () => {
@@ -1731,7 +1666,6 @@ export function buildTools(): ToolDef[] {
       if (site) {
         const shown = await confirmPage(ctx, site.host);
         if (shown === undefined) return fail("cancelled");
-        if (shown) await demoAddressBar(ctx, site.host); // then the address bar, as a person would
         return shown ? ok(`Opened ${site.host} in ${shown}${who}; the browser is showing it.`, true) : ok(`Opened ${app.name}${who} for ${site.host}, but the page could not be confirmed.`, false);
       }
       const up = await until(ctx, async () => { // Store apps can take 10+ seconds to show their first window: the wait ends the moment one appears
@@ -1751,14 +1685,12 @@ export function buildTools(): ToolDef[] {
     async run(a, ctx) {
       const site = siteUrl(a.url);
       if (!site) return fail(`"${short(a.url, 60)}" does not look like a normal web address.`);
-      await demoOpenBrowser(ctx); // the ghost clicks the browser's taskbar icon first
       if (!ctx.live()) return fail("cancelled");
       const r = await ctx.d.appAgent.openUrl(site.url);
       if (!ctx.live()) return fail("cancelled");
       if (!r.ok) return fail(r.reason);
       const shown = await confirmPage(ctx, site.host);
       if (shown === undefined) return fail("cancelled");
-      if (shown) await demoAddressBar(ctx, site.host);
       return shown ? ok(`Opened ${site.host} in ${shown}; the browser is showing it.`, true) : ok(`Asked the browser to open ${site.host}, but the page could not be confirmed.`, false);
     },
   });
