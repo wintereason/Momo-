@@ -11,3 +11,5 @@ electron/runtime.cjs
 !.env.example
 release/
 shots/
+release-build/
+release-test/
