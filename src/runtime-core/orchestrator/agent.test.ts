@@ -57,8 +57,8 @@ function makePc(o: PcOpts = {}) {
     openFolderInVsCode: async () => ({ ok: true }),
     openUrl: async (u) => { log.push(`url:${u}`); return { ok: true }; },
     browserProfiles: async () => o.profiles ?? [],
-    openBrowserProfile: async (b, dir, url): Promise<ActResult> => {
-      log.push(`profile:${b}:${dir}${url ? ":" + url : ""}`);
+    openBrowserProfile: async (b, dir, url, newWindow): Promise<ActResult> => {
+      log.push(`profile:${b}:${dir}${url ? ":" + url : ""}${newWindow ? ":NEW-WINDOW" : ""}`);
       if (o.appears !== false) {
         const h = next++;
         windows.push(raw(h, h, "chrome", `${url ? "YouTube" : "New Tab"} - Google Chrome`));
@@ -441,6 +441,16 @@ describe("browser accounts: described, matched, confirmed", () => {
     await t.session.handleTranscript("s", "open youtube and play some songs");
     expect(t.events.some((e) => e.type === "task.clarification_required")).toBe(false);
     expect(t.pc.log).toEqual(["profile:chrome:null:https://www.youtube.com/"]); // no account switch: the running browser takes the address
+  });
+
+  it("an explicit new window is passed on; the default adds a tab and never asks for a window", async () => {
+    const win = [raw(20, 20, "chrome", "Docs - Google Chrome")];
+    const a = setup([tool("open_app", { app: "Google Chrome", url: "youtube", newWindow: true }), done("Done.")], makePc({ profiles, windows: win }));
+    await a.session.handleTranscript("s", "open youtube in a new chrome window");
+    expect(a.pc.log).toEqual(["profile:chrome:null:https://www.youtube.com/:NEW-WINDOW"]);
+    const b = setup([tool("open_app", { app: "Google Chrome", url: "youtube" }), done("Done.")], makePc({ profiles, windows: win }));
+    await b.session.handleTranscript("s", "open youtube in a new tab");
+    expect(b.pc.log).toEqual(["profile:chrome:null:https://www.youtube.com/"]);
   });
 
   it("a NAMED account is still honoured even when Chrome is already open", async () => {

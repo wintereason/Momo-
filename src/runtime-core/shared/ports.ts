@@ -195,8 +195,8 @@ export interface LaunchPort {
   launchApp(id: string): Promise<ActResult>;
   /** the profiles of a Chromium browser, read from its own settings file (absent in tests and non-Windows builds) */
   browserProfiles?(browser: BrowserKey): Promise<BrowserProfile[]>;
-  /** open the browser with one specific profile (or its last-used one when profileDir is null), optionally at a web address */
-  openBrowserProfile?(browser: BrowserKey, profileDir: string | null, url?: string): Promise<ActResult>;
+  /** open the browser with one specific profile (or its last-used one when profileDir is null), optionally at a web address. A running browser adds the address as a new TAB of its window; `newWindow` asks for a separate window instead. */
+  openBrowserProfile?(browser: BrowserKey, profileDir: string | null, url?: string, newWindow?: boolean): Promise<ActResult>;
   /** open a folder in Visual Studio Code (an application adapter) */
   openFolderInVsCode(folder: string): Promise<ActResult>;
   /** open an http(s) address in the user's default browser */

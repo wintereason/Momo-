@@ -109,7 +109,7 @@ export class AppAgent {
   }
 
   /** Open a browser with one of its profiles. Only a profile that was just listed for that browser may be used. */
-  async openProfile(app: AppEntry, profileDir: string | null, url?: string): Promise<ActResult> {
+  async openProfile(app: AppEntry, profileDir: string | null, url?: string, newWindow?: boolean): Promise<ActResult> {
     const key = browserKeyFor(app.name);
     if (!this.launch?.openBrowserProfile || !key) return { ok: false, reason: "Opening a browser profile isn't available in this build." };
     if (!this.cache || !this.cache.apps.some((x) => x.id === app.id)) return { ok: false, reason: "That isn't an installed app I know about." };
@@ -125,7 +125,7 @@ export class AppAgent {
       address = n.url;
     }
     this.calls++;
-    return this.launch.openBrowserProfile(key, profileDir, address);
+    return this.launch.openBrowserProfile(key, profileDir, address, newWindow === true);
   }
 
   async openFolderInVsCode(folder: string): Promise<ActResult> {

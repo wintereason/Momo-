@@ -84,7 +84,7 @@ export const nodeLaunch: LaunchPort = {
     }
   },
 
-  async openBrowserProfile(browser: BrowserKey, profileDir: string | null, url?: string): Promise<ActResult> {
+  async openBrowserProfile(browser: BrowserKey, profileDir: string | null, url?: string, newWindow?: boolean): Promise<ActResult> {
     if (profileDir !== null && !isProfileDir(profileDir)) return { ok: false, reason: "That isn't a profile I can open." };
     let address: string | null = null;
     if (url !== undefined) {
@@ -96,7 +96,7 @@ export const nodeLaunch: LaunchPort = {
     }
     const exe = browserPaths(browser).exes.find((p) => fs.existsSync(p));
     if (!exe) return { ok: false, reason: "I couldn't find that browser on this PC." };
-    const args = [...(profileDir !== null ? ["--profile-directory=" + profileDir] : []), ...(address ? [address] : [])]; // the profile name is checked above: it can only be Default or Profile N
+    const args = [...(profileDir !== null ? ["--profile-directory=" + profileDir] : []), ...(newWindow === true ? ["--new-window"] : []), ...(address ? [address] : [])]; // the profile name is checked above: it can only be Default or Profile N
     return spawnDetached(exe, args);
   },
 

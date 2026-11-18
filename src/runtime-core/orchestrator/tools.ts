@@ -1658,7 +1658,7 @@ export function buildTools(): ToolDef[] {
         if (up0.value) return ok(`Opened ${app.name} by clicking its icon on the taskbar; its window is showing.`, true);
         // the click did nothing: start it the normal way instead
       }
-      const r = profile || site ? await ctx.d.appAgent.openProfile(app, profile?.dir ?? null, site?.url) : await ctx.d.appAgent.launchApp(app);
+      const r = profile || site ? await ctx.d.appAgent.openProfile(app, profile?.dir ?? null, site?.url, a.newWindow === true) : await ctx.d.appAgent.launchApp(app);
       if (!ctx.live()) return fail("cancelled");
       if (!r.ok) return fail(r.reason);
       // what the planner is told never includes the account's email: only its display name
