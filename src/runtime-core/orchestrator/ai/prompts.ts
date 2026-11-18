@@ -75,9 +75,28 @@ export function parsePlan(text: string): PlanDecision | null {
   return r.success ? r.data : null;
 }
 
+/** shown in place of what a step did, to a cloud planner that may not see the screen */
+export const REDACTED_ARGS = "[withheld: names, paths and titles stay on this PC]";
+export const REDACTED_NOTE = "[Details withheld: file names, paths, window titles and on-screen text are not sent to an online AI.";
+/** what a redacted step says, by outcome: a failed or unverified step must never read as a success */
+export function redactedText(outcome: "ok" | "unverified" | "failed" | "declined"): string {
+  if (outcome === "ok") return `${REDACTED_NOTE} This step succeeded and was verified on the PC; if the goal is complete, finish with done.]`;
+  if (outcome === "unverified") return `${REDACTED_NOTE} This step was done but NOT verified: do not claim it worked; look another way, or tell the user it could not be confirmed.]`;
+  return `${REDACTED_NOTE} This step FAILED: do not repeat it unchanged and do not say it worked; try a different approach, or tell the user it did not work.]`;
+}
+
+/**
+ * The steps as a CLOUD planner may see them while screen context is OFF. Every step that really ran on this PC keeps only its tool name and its outcome:
+ * the arguments (they can hold a picked file path, a window or control name) and the result text (names, paths, titles) are replaced. The real steps,
+ * and what the tools were run with, are never changed. Tools in `openTools` carry nothing about the PC and are shown as they are.
+ */
+export function redactSteps(steps: PlanStep[], openTools: ReadonlySet<string>): PlanStep[] {
+  return steps.map((s) => (s.kind === "tool" && s.ran && !openTools.has(s.tool) ? { ...s, args: REDACTED_ARGS, text: s.outcome === "declined" ? s.text : redactedText(s.outcome) } : s));
+}
+
 /** One thing that already happened in this task, as the planner is shown it. */
 export type PlanStep =
-  | { kind: "tool"; tool: string; args: unknown; outcome: "ok" | "unverified" | "failed" | "declined"; text: string; /** what went wrong, named (recovery foundation; not shown to the planner yet) */ failure?: { kind: string; acted: "no" | "maybe" | "yes" }; /** did the step's input reach the app */ acted?: "no" | "maybe" | "yes" }
+  | { kind: "tool"; tool: string; args: unknown; outcome: "ok" | "unverified" | "failed" | "declined"; text: string; /** what went wrong, named (recovery foundation; not shown to the planner yet) */ failure?: { kind: string; acted: "no" | "maybe" | "yes" }; /** did the step's input reach the app */ acted?: "no" | "maybe" | "yes"; /** the step really ran (or was declined) on this PC: its arguments and result are the PC's, not the planner's own words */ ran?: boolean }
   | { kind: "ask"; question: string; answer: string };
 
 const clip = (s: string, n: number) => (s.length > n ? s.slice(0, n - 1) + "…" : s);

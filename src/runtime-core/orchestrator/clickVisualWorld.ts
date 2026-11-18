@@ -135,9 +135,11 @@ export function clickWorld(o: WorldOpts) {
     sess = r.session;
     await r.session.handleTranscript("s", goal);
     await new Promise((res) => setTimeout(res, 20)); // the release at the end of the task
-    return { ...r, steps: r.results[r.results.length - 1].filter((s) => s.kind === "tool") as Array<{ outcome: string; text: string; tool?: string }> };
+    return { ...r, steps: (r.results[r.results.length - 1] ?? []).filter((s) => s.kind === "tool") as Array<{ outcome: string; text: string; tool?: string }> };
   }
-  return { state, log, pointer, run, cancel: () => { aborted = true; }, cancelTask: () => sess?.orchestrator.cancel(), deps };
+  /** answer the open confirmation of the running task (for tests that use a real AI service and so have no scripted results to read back) */
+  const respond = (taskId: string, yes: boolean) => (sess as unknown as { respondConfirmation(id: string, ok: boolean): Promise<void> }).respondConfirmation(taskId, yes);
+  return { state, log, pointer, run, respond, cancel: () => { aborted = true; }, cancelTask: () => sess?.orchestrator.cancel(), deps };
 }
 
 export { un };

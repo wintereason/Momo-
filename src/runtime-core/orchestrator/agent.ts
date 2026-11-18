@@ -2,7 +2,7 @@ import { parseRuntimeEvent } from "../../types/runtime-events";
 import { decide, resolveYesNo, type Risk } from "../action";
 import { resolveChoice } from "./choice";
 import { TOOL_CATALOG, buildTools, type AgentDeps, type ToolDef, type ToolOutcome } from "./tools";
-import type { PlanStep } from "./ai/prompts";
+import { redactSteps, type PlanStep } from "./ai/prompts";
 import { describeFailure, isTerminal, maxActed, type Acted, type Evidence, type Failure } from "./recovery/taxonomy";
 import { decideRetry, refreshArgs } from "./recovery/policy";
 import { waitResponsive } from "./recovery/hung";
@@ -12,6 +12,8 @@ import { verifyOnly, type ReadOnlyView, type StepTarget } from "./recovery/verif
 export type { AgentDeps };
 export type OrchestratorDeps = AgentDeps;
 
+/** tools whose arguments and results hold no file names, paths or titles (drive letters and sizes, learning progress): an online planner may always see them */
+const OPEN_TOOLS: ReadonlySet<string> = new Set(["drive_info", "language_progress"]);
 const WITHHELD = "[Private result: not shown to the AI. It will be shown to the user exactly as read. If that completes the goal, finish with done.]";
 
 /** What one try of a step left behind (see Orchestrator.executeOnce). */
@@ -203,7 +205,9 @@ export class Orchestrator {
       }
       if (!ai) { this.emit({ type: "task.failed", taskId: task.id, recoverable: true, summary: "I need the AI to work out how to do that, and it isn't available in this build." }); return; }
       this.emit({ type: "task.state", taskId: task.id, state: "working", message: task.moves === 0 ? `Working out how… (${ai.label()})` : "Deciding the next step…" });
-      const r = await ai.plan(task.goal, task.steps, this.catalogue);
+      // an ONLINE planner that may not see the screen is shown only outcomes of what ran here, never its arguments or results (names, paths, titles)
+      const hidden = ai.isCloud() && !ai.canSeeScreen();
+      const r = await ai.plan(task.goal, hidden ? redactSteps(task.steps, OPEN_TOOLS) : task.steps, this.catalogue);
       if (!live()) return;
       if (!r.ok) { this.emit({ type: "task.failed", taskId: task.id, recoverable: true, summary: r.message }); return; }
       task.moves++;
@@ -248,8 +252,8 @@ export class Orchestrator {
   }
 
   /** Record a step for the planner to see. */
-  private note(task: Task, tool: string, args: unknown, outcome: "ok" | "unverified" | "failed" | "declined", text: string, meta: { failure?: Failure; acted?: Acted } = {}): void {
-    task.steps.push({ kind: "tool", tool, args, outcome, text, ...(meta.failure ? { failure: meta.failure } : {}), ...(meta.acted ? { acted: meta.acted } : {}) });
+  private note(task: Task, tool: string, args: unknown, outcome: "ok" | "unverified" | "failed" | "declined", text: string, meta: { failure?: Failure; acted?: Acted; ran?: boolean } = {}): void {
+    task.steps.push({ kind: "tool", tool, args, outcome, text, ...(meta.ran ? { ran: true } : {}), ...(meta.failure ? { failure: meta.failure } : {}), ...(meta.acted ? { acted: meta.acted } : {}) });
     if (outcome === "failed") task.failures++;
   }
 
@@ -280,7 +284,10 @@ export class Orchestrator {
     const d = { ...this.d, emit: (e: Parameters<AgentDeps["emit"]>[0]) => { if (e.type === "cursor.aim" || e.type === "cursor.move" || e.type === "cursor.window") pointed = true; this.d.emit(e); } };
     const ctx = { d, live, confirmed: call.confirmed, lock: call.lock, instruction: () => task.goal };
     if (!call.confirmed && decide({ risk: this.riskOf(call) }, this.d.policy()) === "confirm") {
-      this.askConfirmation(task, call, await call.tool.describe(call.args, ctx));
+      const said = await call.tool.describe(call.args, ctx);
+      // reading the screen for an ONLINE AI: say plainly that it leaves this PC (the picture consent already says so)
+      const online = call.tool.sensitive && this.d.ai?.isCloud() && this.d.ai.canSeeScreen();
+      this.askConfirmation(task, call, online && !/leaves this PC/i.test(said) ? `${said} What is read will be sent to the online AI (${this.d.ai!.label()}): screen information leaves this PC.` : said);
       return "suspended";
     }
     // a step that DOES something is announced aloud ("Opening D:\Projects…"); looking things up is not
@@ -345,7 +352,7 @@ export class Orchestrator {
       if (!out.verified) { task.unverified++; if (isAction && verdict !== "absent") blockRepeat(); }
       const withheld = call.tool.sensitive && !(this.d.ai?.canSeeScreen() ?? false);
       if (withheld) task.reports.push({ text: out.report, epoch: task.epoch });
-      this.note(task, call.tool.name, call.args, out.verified ? "ok" : "unverified", withheld ? WITHHELD : out.brief, { acted, failure: unverifiedFailure });
+      this.note(task, call.tool.name, call.args, out.verified ? "ok" : "unverified", withheld ? WITHHELD : out.brief, { acted, failure: unverifiedFailure, ran: true });
       return "continue";
     }
     if ("needsConfirmation" in out) {
@@ -364,7 +371,7 @@ export class Orchestrator {
     const actedFinal: Failure = { kind: failureOut.kind, acted: maxActed(failureOut.acted, delivered) };
     // it may have happened and nothing shows it did not: the same exact action is not repeated blindly (the planner is told to look first)
     if (isAction && actedFinal.acted !== "no" && verdict !== "absent" && !isTerminal(actedFinal.kind)) blockRepeat();
-    this.note(task, call.tool.name, call.args, "failed", out.reason, { failure: actedFinal, acted: actedFinal.acted });
+    this.note(task, call.tool.name, call.args, "failed", out.reason, { failure: actedFinal, acted: actedFinal.acted, ran: true });
     return this.tooMany(task) ? "stop" : "continue";
   }
 
@@ -506,7 +513,7 @@ export class Orchestrator {
   private async resolveConfirmation(p: Extract<Pending, { kind: "confirm" }>, approved: boolean, live: () => boolean): Promise<void> {
     this.clearPending();
     if (!approved) {
-      p.task.steps.push({ kind: "tool", tool: p.call.tool.name, args: p.call.args, outcome: "declined", text: "The user said no." });
+      p.task.steps.push({ kind: "tool", tool: p.call.tool.name, args: p.call.args, outcome: "declined", text: "The user said no.", ran: true });
       p.task.journal.update(p.task.journal.begin(p.call.tool.name, p.call.args), { phase: "declined" }); // nothing was sent
       this.emit({ type: "task.state", taskId: p.task.id, state: "idle", message: "Okay, I won't do that." });
       return;
