@@ -149,6 +149,7 @@ export class Orchestrator {
       if (live()) this.emit({ type: "task.failed", taskId, summary: "Something went wrong while doing that. You can retry.", recoverable: true });
     } finally {
       wd.finish();
+      this.releaseCapture();
       if (live()) this.busy = false; // a goal that timed out was already released: never release a newer goal's lock
     }
   }
@@ -167,14 +168,21 @@ export class Orchestrator {
       if (live()) this.emit({ type: "task.failed", taskId, summary: "Something went wrong while doing that. You can retry.", recoverable: true });
     } finally {
       wd.finish();
+      this.releaseCapture();
       if (live()) this.busy = false;
     }
+  }
+
+  /** Free any window capture (a no-op, and no helper call, when none was started). Never throws: ending a task must not depend on it. */
+  private releaseCapture(): void {
+    try { void this.d.visualCapture?.release().catch(() => undefined); } catch { /* nothing to free */ }
   }
 
   /** Drop the current goal: pending questions are forgotten and late results are discarded. */
   cancel(): void {
     // whatever the real mouse and keyboard are doing stops now, and anything they hold is let go of (a drag is cancelled, not dropped)
     try { this.d.pointer?.()?.abort?.("cancel"); } catch { /* the pointer may not exist (Show Only) */ }
+    this.releaseCapture();
     if (this.lastTaskId) this.abandoned.add(this.lastTaskId);
     if (this.pending) this.abandoned.add(this.pending.task.id);
     if (this.abandoned.size > 200) this.abandoned = new Set([...this.abandoned].slice(-100));
@@ -270,7 +278,7 @@ export class Orchestrator {
     // did this step point at something on screen? Then the shadow cursor is told how it ENDED (below), and only then
     let pointed = false;
     const d = { ...this.d, emit: (e: Parameters<AgentDeps["emit"]>[0]) => { if (e.type === "cursor.aim" || e.type === "cursor.move" || e.type === "cursor.window") pointed = true; this.d.emit(e); } };
-    const ctx = { d, live, confirmed: call.confirmed, lock: call.lock };
+    const ctx = { d, live, confirmed: call.confirmed, lock: call.lock, instruction: () => task.goal };
     if (!call.confirmed && decide({ risk: this.riskOf(call) }, this.d.policy()) === "confirm") {
       this.askConfirmation(task, call, await call.tool.describe(call.args, ctx));
       return "suspended";

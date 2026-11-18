@@ -133,7 +133,9 @@ describe("the long-lived UI Automation helper process", () => {
   });
 
   it("the event hook code reports kinds and window handles only: it never reads titles, text or pixels, and never touches the network", () => {
-    const part = HELPER_SCRIPT.slice(HELPER_SCRIPT.indexOf("public static class MomoEvents"), HELPER_SCRIPT.indexOf("@@READY"));
+    // exactly the MomoEvents class: it ends where its own C# block ends (the capture code is a separate, lazily compiled block with its own audits)
+    const start = HELPER_SCRIPT.indexOf("public static class MomoEvents");
+    const part = HELPER_SCRIPT.slice(start, HELPER_SCRIPT.indexOf("\n'@", start));
     expect(part.length).toBeGreaterThan(500);
     expect(part).not.toMatch(/GetWindowText|AutomationElement|CopyFromScreen|Bitmap|BitBlt|WebClient|System.Net|File.|Process.GetProcesses/);
     expect(part).toContain("SetWinEventHook");

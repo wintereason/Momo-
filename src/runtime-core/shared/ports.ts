@@ -237,3 +237,11 @@ export interface WindowsSnapshot {
 export interface WindowsPort {
   query(): Promise<WindowsSnapshot>;
 }
+
+/**
+ * How the vision role talks to the long-lived helper for window capture (Phase 6a). The helper keeps the pixels in ITS memory; every reply is
+ * numbers and a verdict, never image data. `send` rejects when the helper is unavailable.
+ */
+export interface CaptureTransport {
+  send(command: "capstart" | "capgrab" | "capinfo" | "capstop" | "capdetect", args: number | number[] | undefined, timeoutMs: number): Promise<unknown>;
+}

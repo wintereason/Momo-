@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
-import type { MenuEntry, MenuResult, TransientsResult, TransientWindow } from "./ports";
+import type { CaptureTransport, MenuEntry, MenuResult, TransientsResult, TransientWindow } from "./ports";
 import type { CaptureResult, ElementAtResult, FsPort, OcrResult, OcrWordsResult, RawWindow, ScreenPort, UiNode, UiReadResult, WindowsPort, WindowsSnapshot } from "./ports";
 
 const withTimeout = <T>(p: Promise<T>, ms: number, fallback: T): Promise<T> =>
@@ -531,5 +531,14 @@ export const nodeScreen: ScreenPort = {
     } catch {
       return { ok: false, reason: "taking the picture took too long" };
     }
+  },
+};
+
+/** The real transport for window capture: the long-lived helper only (a one-shot script would defeat the point). */
+export const nodeCapture: CaptureTransport = {
+  async send(command, args, timeoutMs) {
+    const list = args === undefined ? [] : Array.isArray(args) ? args : [args];
+    if (list.length > 2 || list.some((n) => !Number.isSafeInteger(n) || n <= 0)) throw new Error("invalid argument");
+    return uiaHost.request<unknown>([command, ...list].join(" "), timeoutMs);
   },
 };

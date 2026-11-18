@@ -3,11 +3,11 @@ import { ActionAgent } from "../action";
 import { DesktopAgent } from "../desktop";
 import { FileSystemAgent } from "../filesystem";
 import { Orchestrator } from "./agent";
-import type { ActionPort, AppsPort, ForegroundPort, FsPort, InputPort, LaunchPort, PointerPort, ScreenPort, WindowsPort } from "../shared/ports";
+import type { ActionPort, AppsPort, CaptureTransport, ForegroundPort, FsPort, InputPort, LaunchPort, PointerPort, ScreenPort, WindowsPort } from "../shared/ports";
 import { AppAgent } from "../apps";
 import type { AiService } from "./ai/service";
 import { UiPanelAgent } from "../uipanel";
-import { VisualAgent } from "../vision";
+import { VisualAgent, VisualCapture, VisualLook } from "../vision";
 import { DEFAULT_POLICY, type Policy } from "../action";
 import type { ChangeSource } from "../shared/changeWatch";
 import { localClean, type DictationOutcome, type DictationStyle } from "./dictation";
@@ -44,6 +44,8 @@ export interface SessionDeps {
   cursorLeadMs?: () => number;
   /** the real mouse and keyboard for human-like control; returns undefined when it is off */
   pointer?: () => PointerPort | undefined;
+  /** how window capture reaches the helper (Phase 6a); absent = Momo cannot look at window pixels */
+  capture?: CaptureTransport;
 }
 
 /**
@@ -57,6 +59,8 @@ export class Session {
   readonly actionAgent: ActionAgent;
   readonly uiAgent: UiPanelAgent;
   readonly visualAgent: VisualAgent;
+  readonly visualCapture: VisualCapture;
+  readonly visualLook: VisualLook;
   readonly appAgent: AppAgent;
   readonly orchestrator: Orchestrator;
   private ai?: AiService;
@@ -80,11 +84,13 @@ export class Session {
     this.appAgent = new AppAgent(deps.apps, deps.launch, deps.fs, now);
     this.uiAgent = new UiPanelAgent(this.world, screen);
     this.visualAgent = new VisualAgent(this.world, screen);
+    this.visualCapture = new VisualCapture(deps.capture);
+    this.visualLook = new VisualLook(this.visualCapture, deps.capture);
     this.orchestrator = new Orchestrator({
       world: this.world, fsAgent: this.fsAgent, desktopAgent: this.desktopAgent, actionAgent: this.actionAgent,
       uiAgent: this.uiAgent, visualAgent: this.visualAgent, appAgent: this.appAgent, foreground: deps.foreground, ai: deps.ai, languageSummary: () => this.teacher.getSummary(),
       verifier: new Verifier(), fs: deps.fs, policy: () => this.policy,
-      sleep: deps.sleep, changes: deps.changes, confirmTimeoutMs: deps.confirmTimeoutMs, taskTimeoutMs: deps.taskTimeoutMs, verifyAttempts: deps.verifyAttempts, maxSteps: deps.maxSteps, cursorLeadMs: deps.cursorLeadMs, pointer: deps.pointer,
+      sleep: deps.sleep, changes: deps.changes, confirmTimeoutMs: deps.confirmTimeoutMs, taskTimeoutMs: deps.taskTimeoutMs, verifyAttempts: deps.verifyAttempts, maxSteps: deps.maxSteps, cursorLeadMs: deps.cursorLeadMs, pointer: deps.pointer, visualCapture: this.visualCapture, visualLook: this.visualLook,
       emit: (e) => { if (!this.disposed) deps.emit(e); },
     });
   }
@@ -150,6 +156,7 @@ export class Session {
   /** Discard everything this session knew. */
   dispose(): void {
     this.orchestrator.cancel();
+    void this.visualCapture.release();
     this.world.dispose();
     this.disposed = true;
   }

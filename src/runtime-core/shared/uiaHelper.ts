@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { ChangeEvent, ChangeSource } from "./changeWatch";
+import { CAPTURE_PS } from "./captureHelper";
 
 /**
  * The helper's own source (not user data) as a file in the per-user temp folder, named by a hash of its content so a changed or tampered
@@ -16,7 +17,40 @@ function scriptFile(script: string): string {
   let same = false;
   try { same = fs.readFileSync(file, "utf8") === script; } catch { /* not there yet */ }
   if (!same) fs.writeFileSync(file, script, { encoding: "utf8", mode: 0o600 });
+  if (!pruned) { pruned = true; pruneHelperScripts(dir, file); } // once per process: old versions of this very file are the only thing that ever builds up here
   return file;
+}
+
+let pruned = false;
+const SCRIPT_NAME = /^uia-[0-9a-f]{16}\.ps1$/;
+/** the newest few are always kept (another Momo, or an older build that is still running, may use one) */
+export const KEEP_NEWEST_SCRIPTS = 4;
+/** nothing younger than this is ever removed */
+export const MIN_SCRIPT_AGE_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * Remove old versions of the helper script from its own folder. Every change to the helper writes a new content-hashed file and nothing used to
+ * remove the earlier ones. Deliberately conservative: only plain files named exactly `uia-<16 hex>.ps1` (a name can never point outside the folder),
+ * never the one in use, never the newest few, never anything younger than a day, and every failure (a file a running process still holds, a
+ * permission problem) is ignored. Returns how many were removed.
+ */
+export function pruneHelperScripts(dir: string, keep: string, now: number = Date.now(), fsx: Pick<typeof fs, "readdirSync" | "lstatSync" | "unlinkSync"> = fs): number {
+  let removed = 0;
+  try {
+    const keepName = path.basename(keep);
+    const rows: Array<{ p: string; m: number }> = [];
+    for (const e of fsx.readdirSync(dir, { withFileTypes: true })) {
+      if (!e.isFile() || e.isSymbolicLink() || !SCRIPT_NAME.test(e.name) || e.name === keepName) continue;
+      const p = path.join(dir, e.name);
+      try { const st = fsx.lstatSync(p); if (st.isFile()) rows.push({ p, m: st.mtimeMs }); } catch { /* gone already */ }
+    }
+    rows.sort((a, b) => b.m - a.m);
+    for (const r of rows.slice(KEEP_NEWEST_SCRIPTS)) {
+      if (now - r.m < MIN_SCRIPT_AGE_MS) continue;
+      try { fsx.unlinkSync(r.p); removed++; } catch { /* in use, or not ours to remove */ }
+    }
+  } catch { /* the folder is missing or unreadable: nothing to tidy */ }
+  return removed;
 }
 
 /**
@@ -640,6 +674,7 @@ public static class MomoEvents {
 }
 '@
 
+${CAPTURE_PS}
 [MomoHost]::Dpi()
 [Console]::Out.WriteLine('@@READY')
 [Console]::Out.Flush()
@@ -659,6 +694,12 @@ while ($true) {
     elseif ($p[1] -eq 'uiaplain') { [MomoHost]::Plain = $true; try { $out = [MomoHost]::Read([long]$p[2]) } finally { [MomoHost]::Plain = $false } }
     elseif ($p[1] -eq 'prof') { $out = [MomoHost]::Prof() }
     elseif ($p[1] -eq 'events') { if ($p[2] -eq 'on') { $out = [MomoEvents]::Start() } else { $out = [MomoEvents]::Stop() } }
+    elseif ($p[1] -eq 'capstart') { Load-Capture; $out = [MomoCapture]::Start([long]$p[2]) }
+    elseif ($p[1] -eq 'capgrab') { Load-Capture; $out = [MomoCapture]::Grab() }
+    elseif ($p[1] -eq 'capdetect') { $out = Run-Detect ([int]$p[2]) ([int]$p[3]) }
+    elseif ($p[1] -eq 'capselftest') { Load-Capture; $out = '{"ok":true,"shapes":' + [MomoCapture]::SelfTest() + '}' }
+    elseif ($p[1] -eq 'capinfo') { if ($script:capLoaded) { $out = [MomoCapture]::Info() } else { $out = '{"ok":true,"active":false}' } }
+    elseif ($p[1] -eq 'capstop') { if ($script:capLoaded) { $out = [MomoCapture]::Stop() } else { $out = '{"ok":true,"was":false}' } }
     elseif ($p[1] -eq 'ping') { $out = '{"ok":true}' }
     else { $out = '{"ok":false,"error":"unknown"}' }
   } catch { $out = '{"ok":false,"error":"uia_failed"}' }

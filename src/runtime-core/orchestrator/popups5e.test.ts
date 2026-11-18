@@ -55,12 +55,17 @@ describe("no cost on ordinary steps", () => {
   it("an ordinary (non-popup) step costs well under 5 ms of orchestration with the popup tools registered, and never touches pop-ups", async () => {
     const w = popupWorld({ popups: () => [] });
     const TASKS = 60;
-    const t0 = performance.now();
-    for (let i = 0; i < TASKS; i++) {
-      const r = runPopup(w, [call("list_windows"), finish()]);
-      await r.session.handleTranscript("s" + i, "x");
+    // The best of several rounds: a loaded machine (the whole suite runs in parallel, some tests compile PowerShell code) only ever makes a round
+    // SLOWER, so the fastest round is the cost of the orchestration itself. The limit is unchanged.
+    let perStep = Infinity;
+    for (let round = 0; round < 5; round++) {
+      const t0 = performance.now();
+      for (let i = 0; i < TASKS; i++) {
+        const r = runPopup(w, [call("list_windows"), finish()]);
+        await r.session.handleTranscript("s" + round + "-" + i, "x");
+      }
+      perStep = Math.min(perStep, (performance.now() - t0) / (TASKS * 2)); // a planner turn + a tool step per task
     }
-    const perStep = (performance.now() - t0) / (TASKS * 2); // a planner turn + a tool step per task
     expect(perStep).toBeLessThan(5);
     expect(w.log.looks).toBe(0);      // no pop-up listing
     expect(w.log.menuReads).toBe(0);  // no menu reads

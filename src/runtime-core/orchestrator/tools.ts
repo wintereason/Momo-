@@ -1,6 +1,8 @@
 import { z } from "zod";
 import type { Acted, Failure } from "./recovery/taxonomy";
 import { buildPopupTools } from "./popupTools";
+import { buildVisualTools } from "./visualTools";
+import type { VisualLook } from "../vision";
 import type { Confirmation, ReadOnlyView, StepTarget } from "./recovery/verifyOnly";
 import { parseRuntimeEvent, type RuntimeEvent } from "../../types/runtime-events";
 import { classifyControlRisk, isProgramFile, type ActionAgent, type Policy, type Risk } from "../action";
@@ -26,6 +28,10 @@ import type { AiService } from "./ai/service";
  */
 
 export interface AgentDeps {
+  /** window capture (Phase 6a): released whenever a task ends, is cancelled or waits for the user, so no picture outlives the task that needed it */
+  visualCapture?: { release(): Promise<void> };
+  /** a read-only look at a window's picture (Phase 6b); absent = Momo cannot look at pictures of windows */
+  visualLook?: VisualLook;
   world: WorldModel;
   fsAgent: FileSystemAgent;
   desktopAgent: DesktopAgent;
@@ -69,6 +75,8 @@ export interface ToolCtx {
   confirmed: boolean;
   /** what the approval was for (e.g. the exact control's name), so a changed target is refused */
   lock?: string;
+  /** what the user asked for in this task, in their words (absent in simple fakes). A tool that may only act on something the user NAMED checks against it. */
+  instruction?(): string;
 }
 
 export type ToolOutcome =
@@ -115,7 +123,7 @@ const fail = (reason: string): ToolOutcome => ({ ok: false, reason });
 const failBeforeActing = (reason: string, kind: Failure["kind"] = "uia_failed"): ToolOutcome => ({ ok: false, reason, failure: { kind, acted: "no" } });
 const ok = (brief: string, verified: boolean, report = brief, shown?: string): ToolOutcome => ({ ok: true, brief, report, verified, ...(shown ? { shown } : {}) });
 
-interface Win { hwnd: number; pid: number; title: string; process?: string }
+export interface Win { hwnd: number; pid: number; title: string; process?: string }
 
 function pickTarget(d: AgentDeps, snap: DesktopSnapshot): Win | null {
   const fg = d.foreground?.lastExternal() ?? null;
@@ -236,9 +244,11 @@ async function lookAround(ctx: ToolCtx, win: Win): Promise<void> {
 // together, so what you see is what Momo does. Every real click is guarded: the target is identified first, its window is in front, the
 // pointer is checked to be over THAT window when it arrives, and the user can take over at any moment (move the mouse, or press Esc).
 const GLIDE_MS = 800;
-const humanPointer = (ctx: ToolCtx): PointerPort | undefined => ctx.d.pointer?.();
-const glideMs = (ctx: ToolCtx): number => ((ctx.d.cursorLeadMs?.() ?? 0) > 0 ? GLIDE_MS : 600);
-const stoppedWhy = (reason: string): string => (reason === "stopped" ? "You pressed Esc, so I stopped." : "You moved the mouse, so I stopped and left it to you.");
+export const humanPointer = (ctx: ToolCtx): PointerPort | undefined => ctx.d.pointer?.();
+/** the answer when the real mouse and keyboard are switched off */
+export const HUMAN_OFF = "This needs Human-like control (Settings → General): it uses the real mouse and keyboard, and that is off. Nothing was done.";
+export const glideMs = (ctx: ToolCtx): number => ((ctx.d.cursorLeadMs?.() ?? 0) > 0 ? GLIDE_MS : 600);
+export const stoppedWhy = (reason: string): string => (reason === "stopped" ? "You pressed Esc, so I stopped." : "You moved the mouse, so I stopped and left it to you.");
 /**
  * The last look before a real click: what is at the EXACT point now must still be the control that was meant, and never a password field.
  * Asked of the helper (about 10 ms). If it cannot answer, the window is read again the slow way: an old picture is never enough.
@@ -294,7 +304,7 @@ async function frontAndStill(ctx: ToolCtx, win: Win, timeoutMs: number): Promise
 }
 
 /** Bring a window to the front (restoring it if it was minimized) and wait until Windows confirms it, and that it has stopped moving. */
-async function bringToFront(ctx: ToolCtx, win: Win): Promise<{ front: boolean; moved: boolean }> {
+export async function bringToFront(ctx: ToolCtx, win: Win): Promise<{ front: boolean; moved: boolean }> {
   if (await isFront(ctx, win)) return { front: true, moved: false };
   for (let i = 0; i < 2; i++) {
     if (!ctx.live()) return { front: false, moved: true };
@@ -305,7 +315,7 @@ async function bringToFront(ctx: ToolCtx, win: Win): Promise<{ front: boolean; m
   return { front: false, moved: true };
 }
 
-const titlesNow = async (ctx: ToolCtx): Promise<Map<number, string>> => {
+export const titlesNow = async (ctx: ToolCtx): Promise<Map<number, string>> => {
   try { return new Map((await ctx.d.desktopAgent.snapshot()).windows.filter((w) => !w.isMomo).map((w) => [w.hwnd, w.title])); } catch { return new Map(); }
 };
 /** windows that were not there before: a dialog, a menu, a new app. Part of the evidence AND something worth telling the user. */
@@ -381,7 +391,7 @@ async function popupWindow(ctx: ToolCtx, at: { x: number; y: number }, host: num
  * A real mouse action refused as "covered" (another window sits on that spot): raise the window once and try again, instead of giving up.
  * Every attempt is still guarded the same way (the window under the pointer must be the right one), so a retry can never click the wrong thing.
  */
-async function retryCovered(ctx: ToolCtx, win: Win, act: () => Promise<PointerResult>): Promise<PointerResult> {
+export async function retryCovered(ctx: ToolCtx, win: Win, act: () => Promise<PointerResult>): Promise<PointerResult> {
   let r = await act();
   if (!r.ok && r.reason === "covered" && ctx.live()) {
     await ctx.d.actionAgent.focusWindow({ hwnd: win.hwnd, pid: win.pid });
@@ -406,7 +416,7 @@ const AIM_MS = 450;
 const aimMs = (ctx: ToolCtx): number => ((ctx.d.cursorLeadMs?.() ?? 0) > 0 ? AIM_MS : 0);
 
 /** Momo has identified its target: highlight that exact element (with what it is for) and let it show BEFORE anything moves. */
-async function aimAt(ctx: ToolCtx, rect: NonNullable<UiNode["rect"]>, label: string, say: string, kind?: Kind): Promise<void> {
+export async function aimAt(ctx: ToolCtx, rect: NonNullable<UiNode["rect"]>, label: string, say: string, kind?: Kind): Promise<void> {
   const ev = parseRuntimeEvent({ type: "cursor.aim", x: Math.round(rect.l + rect.w / 2), y: Math.round(rect.t + rect.h / 2), w: Math.round(rect.w), h: Math.round(rect.h), label: short(label, 40), say: short(say, 98), kind: aimTone(kind) });
   if (ev) ctx.d.emit(ev);
   const ms = aimMs(ctx);
@@ -1771,6 +1781,7 @@ export function buildTools(): ToolDef[] {
   void hintWords;
   // menus, dialogs, drop-downs and other transient windows (phase 5): new tools in their own file
   tools.push(...buildPopupTools());
+  tools.push(...buildVisualTools());
   return tools;
 }
 
