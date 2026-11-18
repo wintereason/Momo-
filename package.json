@@ -8,6 +8,7 @@
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "test:real": "node tests/real/run.cjs",
     "desktop": "node scripts/copy-ort.mjs && node scripts/build-runtime.mjs && node scripts/desktop.mjs",
     "desktop:build": "node scripts/copy-ort.mjs && node scripts/build-runtime.mjs && vite build && electron .",
     "predev": "node scripts/copy-ort.mjs",

@@ -1,0 +1,31 @@
+{
+  "about": "Thresholds approved for Phase 8a and the Phase 6 reference measurements. Safety thresholds are absolute. Latency baselines are only COMPARED (a WARN when more than 1.5x slower) and only on a machine like the one they were taken on.",
+  "referenceEnvironment": {
+    "monitors": 1, "scale": 2, "physicalWidth": 2880, "physicalHeight": 1800,
+    "os": "Windows 11 (10.0.26x), Windows PowerShell 5.1, Chrome 157, one 2880x1800 display at about 200%",
+    "source": "Phase 6e measurements (2026-11-17)"
+  },
+  "thresholds": {
+    "click": { "hardPct": 0.90, "targetPct": 0.95, "note": "zero wrong clicks, zero clicks in refusal cases; every non-success positive must be a safe refusal" },
+    "capture": { "p95Ms": 150, "blankAccepted": 0, "note": "Phase 6a acceptance: p95 under 150 ms at 1640x1280, no blank frame accepted" },
+    "busy": { "boundMs": 1500, "slackMs": 300, "note": "Phase 6d: a busy window is refused within the 1.5 s bound" },
+    "idle": { "releaseMs": 20000, "toleranceMs": 2000, "note": "capture is released after 20 s idle" },
+    "handles": { "growth": 20, "note": "helper handle growth over the resource check (Phase 6e fixed a leak of about 2 per frame)" },
+    "detection": { "e2ePct": 0.95, "note": "Phase 6b acceptance: end-to-end label accuracy of at least 95%" },
+    "menu": { "hardPct": 0.90, "note": "Phase 5: zero wrong items chosen" }
+  },
+  "baselines": {
+    "capture.frame.p50": { "value": 88, "unit": "ms", "source": "6e perf: 73-88 ms median at 1640x1280" },
+    "capture.frame.p95": { "value": 114, "unit": "ms", "source": "6e perf: 83-114 ms" },
+    "capture.firstFrame": { "value": 1047, "unit": "ms", "source": "6e perf: first look incl. session start 0.9-1.0 s" },
+    "look.p50": { "value": 121, "unit": "ms", "source": "6e: 106-121 ms (controlled 1640x1280 window)" },
+    "look.p95": { "value": 141, "unit": "ms", "source": "6e: 121-141 ms" },
+    "click.total.p50": { "value": 2851, "unit": "ms", "source": "6e real click run, 40 positives" },
+    "click.total.p95": { "value": 3078, "unit": "ms", "source": "6e real click run" },
+    "click.lastLook.p50": { "value": 305, "unit": "ms", "source": "6e real click run" },
+    "click.lastLook.p95": { "value": 359, "unit": "ms", "source": "6e real click run" },
+    "busy.refusal": { "value": 1520, "unit": "ms", "source": "6e: 1.52 s against the 1.5 s bound" },
+    "uia.read.p50": { "value": 655, "unit": "ms", "source": "6e: UIA read median on the controlled window" },
+    "helper.memory.capturing": { "value": 77, "unit": "MB", "source": "6e: 70 idle, 77 capturing" }
+  }
+}

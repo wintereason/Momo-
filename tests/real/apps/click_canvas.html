@@ -1,0 +1,23 @@
+<!doctype html><html><head><meta charset="utf-8"><title>momo-click|ready|0</title>
+<style>html,body{margin:0;background:#1e2128;overflow:hidden}canvas{display:block}</style></head><body>
+<canvas id="c" width="1000" height="560"></canvas>
+<script>
+// A canvas interface: drawn buttons with no DOM element and no accessibility node. The page reports what it REALLY received in its window title.
+const spec = JSON.parse(decodeURIComponent(location.hash.slice(1) || "%7B%22buttons%22%3A%5B%5D%7D"));
+const cv = document.getElementById('c'), g = cv.getContext('2d');
+let status = 'Ready', n = 0;
+const btns = spec.buttons.map(b => ({ ...b }));
+function draw() {
+  g.fillStyle = '#1e2128'; g.fillRect(0, 0, 1000, 560);
+  g.fillStyle = '#fff'; g.font = '26px Segoe UI'; g.textAlign = 'left'; g.textBaseline = 'top'; g.fillText(status, 30, 24);
+  for (const b of btns) { if (b.hidden) continue; g.fillStyle = b.color; g.fillRect(b.x, b.y, b.w, b.h); g.fillStyle = '#fff'; g.font = '20px Segoe UI'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(b.label, b.x + b.w / 2, b.y + b.h / 2); }
+}
+cv.addEventListener('mousedown', (e) => {
+  const r = cv.getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top;
+  const b = btns.find(q => !q.hidden && x >= q.x && x <= q.x + q.w && y >= q.y && y <= q.y + q.h);
+  n++;
+  document.title = 'momo-click|' + (b ? b.label : '(none)') + '|' + n;
+  if (b) { status = 'Done ' + b.label; draw(); }
+});
+draw();
+</script></body></html>

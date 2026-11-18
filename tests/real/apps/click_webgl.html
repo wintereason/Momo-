@@ -1,0 +1,68 @@
+<!doctype html><html><head><meta charset="utf-8"><title>momo-click|ready|0</title>
+<style>html,body{margin:0;background:#1e2128;overflow:hidden}canvas{display:block}</style></head><body>
+<canvas id="c" width="1000" height="560"></canvas>
+<script>
+// Acceptance-suite test page: a WebGL (GPU-rendered) interface. Every button is a textured quad: its label is drawn into a texture and the GPU draws
+// the texture. There is no DOM element and no accessibility node behind any button. The page reports what it REALLY received in its window title:
+// "momo-click|<label of the button that got the mouse press>|<number of presses>". The spec (buttons) comes in the URL hash.
+// Open it with ?selftest=1 only to check the page itself (it presses its own buttons with synthetic events and reads back pixels; no real input).
+const spec = JSON.parse(decodeURIComponent(location.hash.slice(1) || "%7B%22buttons%22%3A%5B%5D%7D"));
+const cv = document.getElementById('c');
+const gl = cv.getContext('webgl', { antialias: false });
+const W = cv.width, H = cv.height;
+const vs = 'attribute vec2 p;attribute vec2 u;varying vec2 v;void main(){v=u;gl_Position=vec4(p,0.,1.);}';
+const fs = 'precision mediump float;varying vec2 v;uniform sampler2D s;void main(){gl_FragColor=texture2D(s,v);}';
+function sh(type, src) { const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); return s; }
+const pr = gl.createProgram(); gl.attachShader(pr, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(pr, sh(gl.FRAGMENT_SHADER, fs)); gl.linkProgram(pr); gl.useProgram(pr);
+const buf = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+const lp = gl.getAttribLocation(pr, 'p'), lu = gl.getAttribLocation(pr, 'u');
+gl.enableVertexAttribArray(lp); gl.vertexAttribPointer(lp, 2, gl.FLOAT, false, 16, 0); gl.enableVertexAttribArray(lu); gl.vertexAttribPointer(lu, 2, gl.FLOAT, false, 16, 8);
+function makeTex(w, h, draw) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h; draw(c.getContext('2d'), w, h);
+  const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  return t;
+}
+function quad(x, y, w, h, tex) {   // a pixel rectangle (origin top-left) as two triangles; texture row 0 is the top
+  const x0 = x / W * 2 - 1, x1 = (x + w) / W * 2 - 1, y0 = 1 - y / H * 2, y1 = 1 - (y + h) / H * 2;
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([x0, y1, 0, 1, x1, y1, 1, 1, x0, y0, 0, 0, x1, y0, 1, 0]), gl.DYNAMIC_DRAW);
+  gl.bindTexture(gl.TEXTURE_2D, tex); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+const statusTex = (text) => makeTex(600, 44, (g, w, h) => { g.fillStyle = '#1e2128'; g.fillRect(0, 0, w, h); g.fillStyle = '#fff'; g.font = '26px Segoe UI'; g.textAlign = 'left'; g.textBaseline = 'middle'; g.fillText(text, 0, h / 2); });
+const btns = spec.buttons.map((b) => ({ ...b, tex: makeTex(b.w, b.h, (g, w, h) => { g.fillStyle = b.color; g.fillRect(0, 0, w, h); g.fillStyle = '#fff'; g.font = '20px Segoe UI'; g.textAlign = 'center'; g.textBaseline = 'middle'; g.fillText(b.label, w / 2, h / 2); }) }));
+let status = 'Ready', sTex = statusTex(status), n = 0;
+function draw() {
+  gl.viewport(0, 0, W, H); gl.clearColor(0.118, 0.129, 0.157, 1); gl.clear(gl.COLOR_BUFFER_BIT);
+  quad(30, 16, 600, 44, sTex);
+  for (const b of btns) if (!b.hidden) quad(b.x, b.y, b.w, b.h, b.tex);
+}
+function press(clientX, clientY) {
+  const r = cv.getBoundingClientRect(), x = clientX - r.left, y = clientY - r.top;
+  const b = btns.find((q) => !q.hidden && x >= q.x && x <= q.x + q.w && y >= q.y && y <= q.y + q.h);
+  n++;
+  document.title = 'momo-click|' + (b ? b.label : '(none)') + '|' + n;
+  if (b) { status = 'Done ' + b.label; sTex = statusTex(status); draw(); }
+}
+cv.addEventListener('mousedown', (e) => press(e.clientX, e.clientY));
+draw();
+(function frame() { requestAnimationFrame(frame); })();   // keep the page composited like a real GPU-rendered application
+
+if (/selftest/.test(location.search)) {
+  // page self-check: synthetic presses (inside the page only), and the colour the GPU really drew inside each button
+  const hex = (h) => [1, 3, 5].map((i) => parseInt(h.slice(i, i + 2), 16));
+  const out = { drawn: 0, wrongPixel: 0, hits: 0, misses: 0, none: 0 };
+  const px = new Uint8Array(4);
+  for (const b of btns) {
+    draw(); gl.readPixels(Math.round(b.x + 6), Math.round(H - (b.y + 6)), 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    const want = hex(b.color); const close = want.every((v, i) => Math.abs(v - px[i]) <= 4);
+    if (close) out.drawn++; else out.wrongPixel++;
+  }
+  const r = cv.getBoundingClientRect();
+  for (const b of btns) { const before = n; press(r.left + b.x + b.w / 2, r.top + b.y + b.h / 2); if (document.title.startsWith('momo-click|' + b.label + '|')) out.hits++; else out.misses++; }
+  press(r.left + 2, r.top + H - 2); if (document.title.startsWith('momo-click|(none)|')) out.none++;
+  out.buttons = btns.length; out.presses = n;
+  document.title = 'selftest|' + JSON.stringify(out);
+}
+</script></body></html>
